@@ -7,6 +7,8 @@
 //! A configured checkpointer adds [`Error::MissingThreadId`] and
 //! [`Error::Checkpoint`]. [`Error::GraphInterrupt`] is how [`crate::interrupt`]
 //! leaves a node; `invoke` does not return it.
+//! [`Error::ParentGraph`] rejects [`crate::GraphTarget::Parent`] until a
+//! subgraph can route to its parent.
 
 use thiserror::Error;
 
@@ -86,4 +88,13 @@ pub enum Error {
     /// [`Ok`](Result::Ok)`(`[`crate::RunOutput::Interrupted`]`)`.
     #[error("graph interrupt")]
     GraphInterrupt,
+
+    /// [`crate::Command`] set `graph` to [`crate::GraphTarget::Parent`].
+    ///
+    /// Parent routing requires a subgraph. `invoke` returns this error and
+    /// does not commit that command. A node return fails its superstep
+    /// before the barrier: sibling tasks are joined, and that step's writes
+    /// are not stored. An input command fails before any checkpoint write.
+    #[error("parent routing requires a subgraph")]
+    ParentGraph,
 }

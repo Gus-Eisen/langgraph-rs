@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::Error;
+use crate::interrupt::Resume;
 use crate::reducer::Reducer;
 use crate::state::{same_reducer, GraphState, RESERVED_NAMES};
 
@@ -28,14 +29,15 @@ pub const START: &str = "__start__";
 pub const END: &str = "__end__";
 
 type NodeFuture<'a, S> =
-    Pin<Box<dyn Future<Output = Result<<S as GraphState>::Update, Error>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Command<<S as GraphState>::Update>, Error>> + Send + 'a>>;
 
 /// How the runtime runs a node.
 ///
 /// Sync and async nodes both implement this. [`InvokeNode::call`] takes `&S`.
 /// A [`crate::Send`] task merges its JSON object onto a clone of the committed
 /// snapshot first, so the reference is that task's view. [`GraphBuilder::add_node`]
-/// still accepts `fn(&S)`.
+/// still accepts `fn(&S)`. The future resolves to a [`Command`]. A plain
+/// `S::Update` is stored as a command with that update and no `goto`.
 ///
 /// [`GraphBuilder::compile`] does not call [`InvokeNode::call`].
 pub(crate) trait InvokeNode<S>: Send + Sync
@@ -103,6 +105,25 @@ where
     F: Fn(&S) -> Result<S::Update, Error> + Send + Sync,
 {
     fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
+        Box::pin(std::future::ready(
+            (self.0)(state).map(|update| Command::new().update(update)),
+        ))
+    }
+
+    fn is_sync(&self) -> bool {
+        true
+    }
+}
+
+struct SyncCommandNode<F>(F);
+
+impl<S, F> InvokeNode<S> for SyncCommandNode<F>
+where
+    S: GraphState,
+    S::Update: Send + 'static,
+    F: Fn(&S) -> Result<Command<S::Update>, Error> + Send + Sync,
+{
+    fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
         Box::pin(std::future::ready((self.0)(state)))
     }
 
@@ -121,7 +142,53 @@ where
     for<'a> &'a F: AsyncCall<'a, S, F>,
 {
     fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
-        Box::pin(AsyncCall::call(&self.0, state))
+        let future = AsyncCall::call(&self.0, state);
+        Box::pin(async move {
+            let update = future.await?;
+            Ok(Command::new().update(update))
+        })
+    }
+
+    fn is_sync(&self) -> bool {
+        false
+    }
+}
+
+trait AsyncCommandCall<'a, S, F>
+where
+    S: GraphState + 'a,
+    F: ?Sized,
+{
+    type Fut: Future<Output = Result<Command<S::Update>, Error>> + Send + 'a;
+
+    fn call(self, state: &'a S) -> Self::Fut;
+}
+
+impl<'a, S, F, Fut> AsyncCommandCall<'a, S, F> for &'a F
+where
+    S: GraphState + 'a,
+    S::Update: Send,
+    F: Fn(&'a S) -> Fut + ?Sized,
+    Fut: Future<Output = Result<Command<S::Update>, Error>> + Send + 'a,
+{
+    type Fut = Fut;
+
+    fn call(self, state: &'a S) -> Self::Fut {
+        self(state)
+    }
+}
+
+struct AsyncCommandNode<F>(F);
+
+impl<S, F> InvokeNode<S> for AsyncCommandNode<F>
+where
+    S: GraphState + 'static,
+    S::Update: Send,
+    F: Send + Sync + 'static,
+    for<'a> &'a F: AsyncCommandCall<'a, S, F>,
+{
+    fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
+        Box::pin(AsyncCommandCall::call(&self.0, state))
     }
 
     fn is_sync(&self) -> bool {
@@ -142,6 +209,22 @@ pub struct SyncNodeMarker;
 /// one: `add_node::<_, AsyncNodeMarker>(...)`.
 #[derive(Debug, Clone, Copy)]
 pub struct AsyncNodeMarker;
+
+/// Marker for a sync node that returns [`Command`].
+///
+/// [`GraphBuilder::add_node`] infers this from
+/// `fn(&S) -> Result<Command<S::Update>, Error>`. Name it only when that
+/// return type is ambiguous: `add_node::<_, SyncCommandMarker>(...)`.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncCommandMarker;
+
+/// Marker for an async node that returns [`Command`].
+///
+/// [`GraphBuilder::add_node`] infers this from an async function whose
+/// output is `Result<Command<S::Update>, Error>`. Name it only when that
+/// return type is ambiguous: `add_node::<_, AsyncCommandMarker>(...)`.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncCommandMarker;
 
 trait IntoNode<S, Marker>
 where
@@ -170,6 +253,29 @@ where
 {
     fn into_node(self) -> Box<dyn InvokeNode<S>> {
         Box::new(AsyncNode(self))
+    }
+}
+
+impl<S, F> IntoNode<S, SyncCommandMarker> for F
+where
+    S: GraphState + 'static,
+    S::Update: Send + 'static,
+    F: Fn(&S) -> Result<Command<S::Update>, Error> + Send + Sync + 'static,
+{
+    fn into_node(self) -> Box<dyn InvokeNode<S>> {
+        Box::new(SyncCommandNode(self))
+    }
+}
+
+impl<S, F> IntoNode<S, AsyncCommandMarker> for F
+where
+    S: GraphState + 'static,
+    S::Update: Send + 'static,
+    F: Send + Sync + 'static,
+    for<'a> &'a F: AsyncCommandCall<'a, S, F>,
+{
+    fn into_node(self) -> Box<dyn InvokeNode<S>> {
+        Box::new(AsyncCommandNode(self))
     }
 }
 
@@ -280,6 +386,7 @@ impl<const N: usize> IntoEdgeSource for [&str; N] {
 ///
 /// The type lives in this module so its name does not hide the [`std::marker::Send`]
 /// bound used by the builder. The crate root re-exports it as [`crate::Send`].
+/// A conditional router or [`super::Command::goto`] may return it.
 pub(crate) mod packet {
     use serde_json::Value;
 
@@ -489,6 +596,115 @@ impl<const N: usize> IntoRoute for [RouteTarget; N] {
     }
 }
 
+/// Which graph a [`Command`] writes and routes.
+///
+/// [`GraphTarget::Current`] is the graph that is running.
+/// [`GraphTarget::Parent`] asks the enclosing graph to take the command.
+/// Parent routing requires a subgraph, so `invoke` rejects it with
+/// [`Error::ParentGraph`] and does not commit the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphTarget {
+    /// The graph that is running. This is the default.
+    #[default]
+    Current,
+    /// The parent graph. Rejected until subgraphs exist.
+    Parent,
+}
+
+/// Control value a node may return in place of a plain update.
+///
+/// `U` is [`GraphState::Update`]. A node that returns `U` still compiles:
+/// that value is a command with [`Command::update`] set and [`Command::goto`]
+/// left unset. `None` for `goto` keeps the node's static edges and runs its
+/// conditional routers. `Some` replaces both for this step, even when the
+/// list is empty. Plain names in `goto` dedupe. Each [`crate::Send`] is its
+/// own task.
+///
+/// On [`CompiledGraph::invoke`], this is also an input. [`Command::resume`]
+/// is the public resume carrier. [`Command::update`] is merged like input
+/// writes. [`Command::goto`] routes from [`START`] instead of `START`'s
+/// static edges and `START` routers. `resume` on a value returned from a
+/// node is ignored.
+///
+/// Constructors later milestones keep: [`Command::new`], [`Command::parent`],
+/// [`Command::update`], [`Command::resume`], [`Command::goto`], and
+/// [`Command::graph`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Command<U> {
+    /// Partial update merged like a normal node return, or like input writes
+    /// when this command is the `invoke` input. `None` writes no channels.
+    pub update: Option<U>,
+    /// Resume payload for `invoke`. Not used when a node returns this value.
+    ///
+    /// This is the public resume carrier. The type is the milestone 7
+    /// [`Resume`]. When this is set, it is used instead of
+    /// [`crate::RunConfig::resume`].
+    pub resume: Option<Resume>,
+    /// Destinations that replace static outgoing edges for this step.
+    ///
+    /// `None` keeps those edges and runs the node's conditional routers.
+    /// `Some` skips both. Names and [`crate::Send`] packets use the same
+    /// fan-out as a conditional router. A path map does not rewrite them.
+    pub goto: Option<Vec<RouteTarget>>,
+    /// Graph that should apply this command. Defaults to
+    /// [`GraphTarget::Current`].
+    pub graph: GraphTarget,
+}
+
+impl<U> Command<U> {
+    /// Command with no update, no resume, no `goto`, on the current graph.
+    pub const fn new() -> Self {
+        Self {
+            update: None,
+            resume: None,
+            goto: None,
+            graph: GraphTarget::Current,
+        }
+    }
+
+    /// Command that routes in the parent graph.
+    ///
+    /// `invoke` rejects this with [`Error::ParentGraph`] and does not commit
+    /// it. Parent routing requires a subgraph.
+    pub const fn parent() -> Self {
+        Self {
+            update: None,
+            resume: None,
+            goto: None,
+            graph: GraphTarget::Parent,
+        }
+    }
+
+    /// Store `update` as the channel write for this command.
+    pub fn update(mut self, update: U) -> Self {
+        self.update = Some(update);
+        self
+    }
+
+    /// Store `resume` for an `invoke` input.
+    ///
+    /// A node that returns this command does not resume the graph with it.
+    pub fn resume(mut self, resume: Resume) -> Self {
+        self.resume = Some(resume);
+        self
+    }
+
+    /// Replace this command's `goto` with `goto`.
+    ///
+    /// `goto` may be a node name, [`END`], a [`crate::Send`], or a list that
+    /// mixes them. The stored list is `Some`, including when `goto` is empty.
+    pub fn goto(mut self, goto: impl IntoRoute) -> Self {
+        self.goto = Some(goto.into_targets());
+        self
+    }
+
+    /// Choose which graph applies this command.
+    pub fn graph(mut self, graph: GraphTarget) -> Self {
+        self.graph = graph;
+        self
+    }
+}
+
 /// One ordinary or waiting edge, in registration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Edge {
@@ -656,10 +872,13 @@ impl<S: GraphState> GraphBuilder<S> {
 
     /// Record a node.
     ///
-    /// `node` is a sync function `fn(&S) -> Result<S::Update, Error>` or an
-    /// async function that returns
-    /// `Future<Output = Result<S::Update, Error>> + Send`. Both are stored
-    /// type-erased. This does not call `node`.
+    /// `node` is a sync function `fn(&S) -> Result<S::Update, Error>` or
+    /// `fn(&S) -> Result<Command<S::Update>, Error>`, or an async function
+    /// that returns `Future<Output = Result<_, Error>> + Send` for those same
+    /// payloads. A plain update is a [`Command`] with that update and no
+    /// `goto`. A closure that returns only [`Err`](Result::Err) needs a
+    /// return type so the compiler can tell an update from a command.
+    /// Both are stored type-erased. This does not call `node`.
     ///
     /// Names are unique. [`Self::compile`] rejects a duplicate, an empty
     /// name, or a reserved name. `S` and `S::Update` are `'static`, and
