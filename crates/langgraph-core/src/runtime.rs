@@ -23,7 +23,9 @@ use langgraph_checkpoint::{
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
-use crate::builder::{ConditionalEdge, Edge, EdgeSource, InterruptSet, InvokeNode, RouteTarget};
+use crate::builder::{
+    Command, ConditionalEdge, Edge, EdgeSource, GraphTarget, InterruptSet, InvokeNode, RouteTarget,
+};
 use crate::interrupt::{
     dynamic_interrupts, has_dynamic_interrupt, is_breakpoint_marker, is_pause, scope_task,
     stored_resume, task_done, task_interrupted, with_thread_frame, FrameHandle, Interrupt,
@@ -49,9 +51,11 @@ pub const DEFAULT_RECURSION_LIMIT: u32 = 25;
 ///
 /// With no checkpointer, `thread_id` and `checkpoint_id` are ignored and
 /// state lives only for that call. A checkpointer without a thread id is
-/// [`Error::MissingThreadId`] before any node runs. [`RunConfig::resume`]
-/// continues a pause. When it is set on a loaded checkpoint, `input` is not
-/// applied as channel writes.
+/// [`Error::MissingThreadId`] before any node runs.
+/// [`RunConfig::resume`] continues a pause when the input is `&S`.
+/// When it is set on a loaded checkpoint, that `&S` input is not applied
+/// as channel writes. A [`crate::Command`] input carries its own resume,
+/// which is used instead of this field when both are set.
 #[derive(Clone)]
 pub struct RunConfig {
     recursion_limit: u32,
@@ -111,8 +115,13 @@ impl RunConfig {
     /// Value that fills the next unanswered [`crate::interrupt`] call.
     ///
     /// [`Resume::Value`] fills one call. [`Resume::Map`] fills the call with
-    /// that id. A loaded checkpoint does not also apply `input` when this is
-    /// set. A resume value with no checkpointer is [`Error::MissingThreadId`].
+    /// that id. A loaded checkpoint does not also apply an `&S` input when
+    /// this is set. A resume value with no checkpointer is
+    /// [`Error::MissingThreadId`].
+    ///
+    /// [`crate::Command::resume`] on the `invoke` input is the public
+    /// carrier. When that field is set it is used instead of this one.
+    /// This method still continues a pause for an `&S` input.
     pub fn resume(mut self, resume: Resume) -> Self {
         self.resume = Some(resume);
         self
@@ -213,12 +222,14 @@ where
 {
     /// Run the graph until it finishes or pauses.
     ///
-    /// `input` is written as channel updates attributed to [`START`], through
-    /// the normal reducers. That write is not a superstep. With no
-    /// checkpointer this is the whole state of a fresh run: the map starts
-    /// empty, then the input is folded in. A loaded checkpoint receives the
-    /// same writes unless [`RunConfig::resume`] is set or the checkpoint is
-    /// already a pause. In those cases `input` is not applied.
+    /// `input` is `&S` or a [`crate::Command`]. Channel updates are attributed
+    /// to [`START`] and are not a superstep. With no checkpointer this is the
+    /// whole state of a fresh run: the map starts empty, then the input is
+    /// folded in. A loaded checkpoint receives an `&S` input unless
+    /// [`RunConfig::resume`] is set or the checkpoint is already a pause. In
+    /// those cases the `&S` input is not applied. A command `update` is still
+    /// applied. A command `resume` is the public resume carrier and is used
+    /// instead of [`RunConfig::resume`] when both are set.
     ///
     /// Scheduling uses control channels, not the user-channel versions. A
     /// normal edge fires after its source completes. [`START`] fires the
@@ -231,12 +242,25 @@ where
     /// reads that snapshot with the packet's JSON object merged on top, and
     /// each packet is its own task, including two sends to the same node.
     /// Sync nodes are called on `spawn_blocking`. Async nodes are awaited on
-    /// this runtime. After a node returns, each of its conditional routers
-    /// runs inside that task. A router sees `reduce(snapshot, this_node_update)`
-    /// and does not see other tasks from this step. A static path map is
-    /// applied to plain labels before names are checked. A [`crate::Send`]
-    /// names its node directly. An unknown name is [`Error::UnknownNode`] and
-    /// that step does not commit.
+    /// this runtime. After a node returns a plain update, each of its
+    /// conditional routers runs inside that task. A router sees
+    /// `reduce(snapshot, this_node_update)` and does not see other tasks from
+    /// this step. A static path map is applied to plain labels before names
+    /// are checked. A [`crate::Send`] names its node directly. An unknown name
+    /// is [`Error::UnknownNode`] and that step does not commit.
+    ///
+    /// A node may return [`crate::Command`] instead of `S::Update`. `update`
+    /// is merged like a normal node return. `goto`, when set, replaces that
+    /// node's static outgoing edges for this step and skips its conditional
+    /// routers. Plain names in `goto` still dedupe. Each [`crate::Send`] is
+    /// its own task. `resume` on a node return is ignored.
+    /// [`GraphTarget::Parent`] is [`Error::ParentGraph`] and that superstep
+    /// does not commit. Parent routing requires a subgraph.
+    ///
+    /// A command `goto` on the input routes from [`START`] for this run and
+    /// does not also fire `START`'s static edges or `START` routers.
+    /// [`GraphTarget::Parent`] on the input is [`Error::ParentGraph`] before
+    /// any checkpoint write.
     ///
     /// The barrier folds the step's writes in `(task_path, task_id, write_index)`
     /// order. `task_path` is empty at the root. `task_id` is the node name for
@@ -268,15 +292,16 @@ where
     /// breakpoint pause does not count as a superstep.
     ///
     /// Polling this future outside tokio returns [`Error::NoRuntime`]. There
-    /// is no `stream` method and no `Command` on this call. A conditional
-    /// router may return [`crate::Send`].
+    /// is no `stream` method. A conditional router or a command `goto` may
+    /// return [`crate::Send`].
     ///
     /// With a checkpointer, the call loads `config`'s checkpoint first
     /// (`checkpoint_id` when set, otherwise the latest in the thread and
     /// namespace). If the loaded checkpoint still has nodes scheduled, those
     /// nodes run. The call does not start again from [`START`]. If nothing is
     /// scheduled, or there is no checkpoint yet, `done:__start__` increments
-    /// and the entry nodes run on the merged state. An input checkpoint
+    /// and the entry nodes run on the merged state. A command `goto` skips
+    /// that increment and schedules its own targets instead. An input checkpoint
     /// (`source: Input`, step `-1` on a fresh thread) is stored after that
     /// preparation and before the first superstep, except when this call is
     /// continuing a pause. Each committed superstep stores a `Loop`
@@ -285,10 +310,25 @@ where
     /// A `checkpoint_id` loads that snapshot. The following `put` creates a
     /// new checkpoint whose parent is the selected id. Older checkpoints,
     /// including the previous tip, stay as they were.
-    pub async fn invoke(&self, input: &S, config: &RunConfig) -> Result<RunOutput<S>, Error> {
+    pub async fn invoke<I>(&self, input: I, config: &RunConfig) -> Result<RunOutput<S>, Error>
+    where
+        I: InvokeInput<S>,
+    {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(Error::NoRuntime);
         }
+        let run_input = input.into_run_input()?;
+        if run_input.graph == GraphTarget::Parent {
+            return Err(Error::ParentGraph);
+        }
+        let RunInput {
+            writes,
+            resume: command_resume,
+            goto,
+            graph: _,
+            honor_on_resume,
+        } = run_input;
+        let resume = command_resume.or_else(|| config.resume.clone());
         if config.checkpointer.is_some() && config.get_thread_id().is_none() {
             return Err(Error::MissingThreadId);
         }
@@ -296,7 +336,7 @@ where
         if breakpoints && config.checkpointer.is_none() {
             return Err(Error::MissingThreadId);
         }
-        if config.resume.is_some() && config.checkpointer.is_none() {
+        if resume.is_some() && config.checkpointer.is_none() {
             return Err(Error::MissingThreadId);
         }
         if config.recursion_limit < 1 {
@@ -330,21 +370,28 @@ where
         }
 
         let continuing_pause = is_pause(&carried_writes);
-        let skip_input = loaded && (continuing_pause || config.resume.is_some());
+        let skip_input = loaded && (continuing_pause || resume.is_some());
         if skip_input {
             carried_writes.retain(|write| !is_breakpoint_marker(write));
+            if honor_on_resume && !writes.is_empty() {
+                channels.apply_writes(&writes)?;
+            }
         } else {
-            let writes = input_writes(input)?;
             let input_channels = channel_names(&writes);
             channels.apply_writes(&writes)?;
             let pending = schedule(&self.edges, &nodes, &control);
             if !loaded || pending.is_empty() {
-                control.bump_done(START);
-                if conditionals.iter().any(|edge| edge.from == START) {
-                    let state = channels.to_state::<S>()?;
-                    let routes =
-                        route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
+                if let Some(goto) = &goto {
+                    let routes = targets_to_routes::<S>(goto, COMMAND_EDGE, known.as_ref())?;
                     control.apply_routes(&routes);
+                } else {
+                    control.bump_done(START);
+                    if conditionals.iter().any(|edge| edge.from == START) {
+                        let state = channels.to_state::<S>()?;
+                        let routes =
+                            route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
+                        control.apply_routes(&routes);
+                    }
                 }
             }
             if let Some(saver) = saver.as_ref() {
@@ -421,6 +468,7 @@ where
                     known: &known,
                     pending: &carried_writes,
                     config,
+                    resume: resume.as_ref(),
                 },
             )
             .await?
@@ -775,6 +823,8 @@ struct TaskOutput {
     writes: Vec<Write>,
     routed: Vec<RoutePush>,
     pause: Option<TaskPause>,
+    /// `Command.goto` replaced this task's static outgoing edges.
+    skip_static: bool,
 }
 
 struct StepShared<S: GraphState> {
@@ -807,6 +857,81 @@ fn input_writes<S: GraphState>(input: &S) -> Result<Vec<Write>, Error> {
         }
     }
     Ok(writes)
+}
+
+/// Prepared `invoke` input.
+///
+/// [`InvokeInput::into_run_input`] builds this. `&S` fills `writes` from the
+/// whole state. [`Command`] fills them from `update`.
+#[derive(Debug)]
+pub struct RunInput {
+    /// Channel writes attributed to [`START`].
+    pub writes: Vec<Write>,
+    /// Resume payload for this call, if the input carried one.
+    pub resume: Option<Resume>,
+    /// `Some` replaces the static edges and routers from [`START`].
+    pub goto: Option<Vec<RouteTarget>>,
+    /// [`GraphTarget::Parent`] is rejected before a checkpoint write.
+    pub graph: GraphTarget,
+    /// When resuming, apply `writes`. `&S` inputs leave this false.
+    pub(crate) honor_on_resume: bool,
+}
+
+mod invoke_sealed {
+    use super::{Command, GraphState};
+
+    pub trait Sealed<S: GraphState> {}
+
+    impl<S: GraphState> Sealed<S> for &S {}
+
+    impl<S: GraphState> Sealed<S> for Command<S::Update> {}
+}
+
+/// Value accepted by [`crate::CompiledGraph::invoke`].
+///
+/// `&S` is a full state write. [`Command`] may carry `update`, `resume`,
+/// and `goto`. The trait is sealed.
+#[allow(private_bounds)]
+pub trait InvokeInput<S: GraphState>: invoke_sealed::Sealed<S> {
+    /// Channel writes and control for this call.
+    fn into_run_input(self) -> Result<RunInput, Error>;
+}
+
+impl<S> InvokeInput<S> for &S
+where
+    S: GraphState,
+{
+    fn into_run_input(self) -> Result<RunInput, Error> {
+        Ok(RunInput {
+            writes: input_writes(self)?,
+            resume: None,
+            goto: None,
+            graph: GraphTarget::Current,
+            honor_on_resume: false,
+        })
+    }
+}
+
+impl<S> InvokeInput<S> for Command<S::Update>
+where
+    S: GraphState,
+{
+    fn into_run_input(self) -> Result<RunInput, Error> {
+        if self.graph == GraphTarget::Parent {
+            return Err(Error::ParentGraph);
+        }
+        let writes = match &self.update {
+            Some(update) => S::update_to_writes(update, &[], START)?,
+            None => Vec::new(),
+        };
+        Ok(RunInput {
+            writes,
+            resume: self.resume,
+            goto: self.goto,
+            graph: self.graph,
+            honor_on_resume: true,
+        })
+    }
 }
 
 fn node_map<S>(
@@ -926,6 +1051,74 @@ fn ready_triggers(edges: &[Edge], node: &str, control: &Control) -> Option<Vec<(
     }
 }
 
+/// Branch index for [`crate::Command::goto`]. It is not a conditional edge.
+const COMMAND_EDGE: usize = usize::MAX;
+
+fn push_send<S: GraphState>(
+    node: &str,
+    value: &Value,
+    edge_index: usize,
+    known: &BTreeSet<String>,
+) -> Result<Option<RoutePush>, Error> {
+    if node == END {
+        return Ok(None);
+    }
+    if !known.contains(node) {
+        return Err(Error::UnknownNode(node.to_string()));
+    }
+    if !value.is_object() {
+        return Err(Error::InvalidUpdate(
+            "Send value must be a JSON object".into(),
+        ));
+    }
+    if let Some(object) = value.as_object() {
+        for key in object.keys() {
+            if !S::schema().iter().any(|field| field.name == key) {
+                return Err(Error::InvalidUpdate(format!(
+                    "Send value writes unknown channel '{key}'"
+                )));
+            }
+        }
+    }
+    Ok(Some(RoutePush {
+        edge_index,
+        destination: node.to_string(),
+        send: Some(value.clone()),
+    }))
+}
+
+fn targets_to_routes<S: GraphState>(
+    targets: &[RouteTarget],
+    edge_index: usize,
+    known: &BTreeSet<String>,
+) -> Result<Vec<RoutePush>, Error> {
+    let mut routed = Vec::new();
+    for target in targets {
+        let route = match target {
+            RouteTarget::Node(destination) => {
+                if destination == END {
+                    None
+                } else if !known.contains(destination) {
+                    return Err(Error::UnknownNode(destination.clone()));
+                } else {
+                    Some(RoutePush {
+                        edge_index,
+                        destination: destination.clone(),
+                        send: None,
+                    })
+                }
+            }
+            RouteTarget::Send(packet) => {
+                push_send::<S>(&packet.node, &packet.value, edge_index, known)?
+            }
+        };
+        if let Some(route) = route {
+            routed.push(route);
+        }
+    }
+    Ok(routed)
+}
+
 fn route_from<S: GraphState>(
     conditionals: &[ConditionalEdge<S>],
     from: &str,
@@ -959,31 +1152,11 @@ fn route_from<S: GraphState>(
                     }
                 }
                 RouteTarget::Send(packet) => {
-                    if packet.node == END {
-                        continue;
+                    if let Some(route) =
+                        push_send::<S>(&packet.node, &packet.value, edge_index, known)?
+                    {
+                        routed.push(route);
                     }
-                    if !known.contains(&packet.node) {
-                        return Err(Error::UnknownNode(packet.node));
-                    }
-                    if !packet.value.is_object() {
-                        return Err(Error::InvalidUpdate(
-                            "Send value must be a JSON object".into(),
-                        ));
-                    }
-                    if let Some(object) = packet.value.as_object() {
-                        for key in object.keys() {
-                            if !S::schema().iter().any(|field| field.name == key) {
-                                return Err(Error::InvalidUpdate(format!(
-                                    "Send value writes unknown channel '{key}'"
-                                )));
-                            }
-                        }
-                    }
-                    routed.push(RoutePush {
-                        edge_index,
-                        destination: packet.node,
-                        send: Some(packet.value),
-                    });
                 }
             }
         }
@@ -1000,29 +1173,44 @@ fn preview_state<S: GraphState>(base: &ChannelMap, writes: &[Write]) -> Result<S
     preview.to_state()
 }
 
-fn after_update<S: GraphState>(
+fn after_command<S: GraphState>(
     name: String,
     task_id: String,
-    update: S::Update,
+    command: Command<S::Update>,
     shared: &StepShared<S>,
 ) -> Result<TaskOutput, Error> {
-    let writes = S::update_to_writes(&update, &[], &task_id)?;
-    let routed = if shared.conditionals.iter().any(|edge| edge.from == name) {
+    if command.graph == GraphTarget::Parent {
+        return Err(Error::ParentGraph);
+    }
+    let writes = match &command.update {
+        Some(update) => S::update_to_writes(update, &[], &task_id)?,
+        None => Vec::new(),
+    };
+    let (routed, skip_static) = if let Some(goto) = &command.goto {
+        (
+            targets_to_routes::<S>(goto, COMMAND_EDGE, shared.known.as_ref())?,
+            true,
+        )
+    } else if shared.conditionals.iter().any(|edge| edge.from == name) {
         let preview = preview_state::<S>(&shared.base, &writes)?;
-        route_from(
-            shared.conditionals.as_slice(),
-            &name,
-            &preview,
-            shared.known.as_ref(),
-        )?
+        (
+            route_from(
+                shared.conditionals.as_slice(),
+                &name,
+                &preview,
+                shared.known.as_ref(),
+            )?,
+            false,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     Ok(TaskOutput {
         task_id,
         writes,
         routed,
         pause: None,
+        skip_static,
     })
 }
 
@@ -1049,7 +1237,10 @@ fn node_failure(name: &str, error: Error) -> Error {
     }
 }
 
-fn drive_sync<S: GraphState>(node: &dyn InvokeNode<S>, state: &S) -> Result<S::Update, Error> {
+fn drive_sync<S: GraphState>(
+    node: &dyn InvokeNode<S>,
+    state: &S,
+) -> Result<Command<S::Update>, Error> {
     let mut future = node.call(state);
     let waker = std::task::Waker::noop();
     let mut context = std::task::Context::from_waker(waker);
@@ -1094,14 +1285,14 @@ where
     if node.is_sync() {
         tokio::task::spawn_blocking(move || {
             with_thread_frame(Arc::clone(&frame), || {
-                let update = drive_sync(node.as_ref(), snapshot.as_ref());
-                finish_task(name, task_id, update, frame.as_ref(), shared.as_ref())
+                let command = drive_sync(node.as_ref(), snapshot.as_ref());
+                finish_task(name, task_id, command, frame.as_ref(), shared.as_ref())
             })
         })
     } else {
         tokio::spawn(scope_task(Arc::clone(&frame), async move {
-            let update = node.call(snapshot.as_ref()).await;
-            finish_task(name, task_id, update, frame.as_ref(), shared.as_ref())
+            let command = node.call(snapshot.as_ref()).await;
+            finish_task(name, task_id, command, frame.as_ref(), shared.as_ref())
         }))
     }
 }
@@ -1109,7 +1300,7 @@ where
 fn finish_task<S: GraphState>(
     name: String,
     task_id: String,
-    update: Result<S::Update, Error>,
+    command: Result<Command<S::Update>, Error>,
     frame: &InterruptFrame,
     shared: &StepShared<S>,
 ) -> Result<TaskOutput, Error> {
@@ -1122,11 +1313,13 @@ fn finish_task<S: GraphState>(
                 interrupt,
                 resume_values: frame.resume_values(),
             }),
+            skip_static: false,
         });
     }
-    match update {
-        Ok(update) => after_update(name, task_id, update, shared),
+    match command {
+        Ok(command) => after_command(name, task_id, command, shared),
         Err(Error::MissingThreadId) => Err(Error::MissingThreadId),
+        Err(Error::ParentGraph) => Err(Error::ParentGraph),
         Err(error) => Err(node_failure(&name, error)),
     }
 }
@@ -1137,6 +1330,7 @@ struct SuperstepInput<'a, S: GraphState> {
     known: &'a Arc<BTreeSet<String>>,
     pending: &'a [PendingWrite],
     config: &'a RunConfig,
+    resume: Option<&'a Resume>,
 }
 
 async fn run_superstep<S>(
@@ -1155,6 +1349,7 @@ where
         known,
         pending,
         config,
+        resume,
     } = input;
     for task in &scheduled {
         if !nodes.contains_key(&task.name) {
@@ -1179,7 +1374,7 @@ where
         conditionals: Arc::clone(conditionals),
         known: Arc::clone(known),
     });
-    let (null_value, resume_map) = resume_parts(config.get_resume());
+    let (null_value, resume_map) = resume_parts(resume);
     let null_owner =
         null_resume_task(&scheduled, pending, null_value.is_some()).map(str::to_string);
 
@@ -1188,12 +1383,13 @@ where
     let mut handle_names = Vec::new();
     for (task, view) in scheduled.iter().zip(views) {
         if task_done(pending, &task.task_id) {
-            let (writes, routed) = decode_replay(pending, &task.task_id)?;
+            let replay = decode_replay(pending, &task.task_id)?;
             results.push(TaskOutput {
                 task_id: task.task_id.clone(),
-                writes,
-                routed,
+                writes: replay.writes,
+                routed: replay.routed,
                 pause: None,
+                skip_static: replay.skip_static,
             });
             continue;
         }
@@ -1241,6 +1437,12 @@ where
     }
     if failures
         .iter()
+        .any(|(_, error)| matches!(error, Error::ParentGraph))
+    {
+        return Err(Error::ParentGraph);
+    }
+    if failures
+        .iter()
         .any(|(_, error)| matches!(error, Error::MissingThreadId))
     {
         return Err(Error::MissingThreadId);
@@ -1263,7 +1465,12 @@ where
             } else {
                 groups.insert(
                     result.task_id.clone(),
-                    encode_finished(&result.task_id, &result.writes, &result.routed),
+                    encode_finished(
+                        &result.task_id,
+                        &result.writes,
+                        &result.routed,
+                        result.skip_static,
+                    ),
                 );
             }
         }
@@ -1285,7 +1492,13 @@ where
         if !task.consumed.is_empty() {
             control.mark_consumed(&task.name, &task.consumed);
         }
-        control.bump_done(&task.name);
+        let skip_static = results
+            .iter()
+            .find(|result| result.task_id == task.task_id)
+            .is_some_and(|result| result.skip_static);
+        if !skip_static {
+            control.bump_done(&task.name);
+        }
     }
     drop_executed_sends(control, &scheduled);
     for result in &results {
@@ -1398,7 +1611,12 @@ async fn put_pending(
     Ok(())
 }
 
-fn encode_finished(task_id: &str, writes: &[Write], routes: &[RoutePush]) -> Vec<PendingWrite> {
+fn encode_finished(
+    task_id: &str,
+    writes: &[Write],
+    routes: &[RoutePush],
+    skip_static: bool,
+) -> Vec<PendingWrite> {
     let mut pending = Vec::new();
     for write in writes {
         pending.push(PendingWrite {
@@ -1412,6 +1630,7 @@ fn encode_finished(task_id: &str, writes: &[Write], routes: &[RoutePush]) -> Vec
         channel: CHANNEL_TASKS.to_string(),
         value: json!({
             "status": "done",
+            "skip_static": skip_static,
             "routes": routes
                 .iter()
                 .map(|route| {
@@ -1454,12 +1673,16 @@ fn encode_interrupted(
     pending
 }
 
-fn decode_replay(
-    pending: &[PendingWrite],
-    task_id: &str,
-) -> Result<(Vec<Write>, Vec<RoutePush>), Error> {
+struct ReplayedTask {
+    writes: Vec<Write>,
+    routed: Vec<RoutePush>,
+    skip_static: bool,
+}
+
+fn decode_replay(pending: &[PendingWrite], task_id: &str) -> Result<ReplayedTask, Error> {
     let mut writes = Vec::new();
     let mut routes = Vec::new();
+    let mut skip_static = false;
     let mut saw_done = false;
     for write in pending {
         if write.task_id != task_id {
@@ -1468,6 +1691,11 @@ fn decode_replay(
         if write.channel == CHANNEL_TASKS {
             saw_done = true;
             routes = parse_routes(&write.value)?;
+            skip_static = write
+                .value
+                .get("skip_static")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             continue;
         }
         if write.channel == CHANNEL_RESUME || write.channel == CHANNEL_INTERRUPT {
@@ -1488,7 +1716,11 @@ fn decode_replay(
             "task '{task_id}' is missing its pending result"
         )));
     }
-    Ok((writes, routes))
+    Ok(ReplayedTask {
+        writes,
+        routed: routes,
+        skip_static,
+    })
 }
 
 fn parse_routes(value: &Value) -> Result<Vec<RoutePush>, Error> {
@@ -2307,7 +2539,7 @@ mod tests {
                     a_flag.fetch_add(1, Ordering::SeqCst);
                     Ok(set_count(5))
                 })
-                .add_node("b", |_state: &Sample| {
+                .add_node("b", |_state: &Sample| -> Result<SampleUpdate, Error> {
                     Err(Error::InvalidUpdate("boom".into()))
                 })
                 .add_node("after", move |_state: &Sample| {

@@ -51,9 +51,10 @@ pub struct Interrupt {
 /// Value that fills an unanswered [`interrupt`] call.
 ///
 /// [`Resume::Value`] fills the next unanswered call. [`Resume::Map`] fills
-/// the call whose id is the key. When a run config carries a resume value,
-/// [`crate::CompiledGraph::invoke`] does not also apply `input` as channel
-/// writes.
+/// the call whose id is the key. [`crate::Command::resume`] on an `invoke`
+/// input is the public carrier and uses this type. [`crate::RunConfig::resume`]
+/// still accepts it. When a call carries either resume value, `invoke` does
+/// not also apply an `&S` input as channel writes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resume {
     /// One value for the next unanswered interrupt.

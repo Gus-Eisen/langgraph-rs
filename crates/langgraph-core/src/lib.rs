@@ -8,7 +8,8 @@
 //! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
 //! runtime. A checkpointer on [`RunConfig`] stores each superstep and can
 //! resume a thread. [`interrupt`] pauses a node until [`Resume`] supplies a
-//! value. A conditional router may return [`Send`]. See the repository
+//! value. A conditional router may return [`Send`]. A node may return
+//! [`Command`] in place of a plain update. See the repository
 //! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
@@ -22,14 +23,17 @@ mod runtime;
 mod state;
 
 pub use builder::{
-    packet::Send, AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, InterruptNodes,
-    IntoEdgeSource, IntoRoute, Route, RouteTarget, SyncNodeMarker, END, START,
+    packet::Send, AsyncCommandMarker, AsyncNodeMarker, Command, CompiledGraph, EdgeSource,
+    GraphBuilder, GraphTarget, InterruptNodes, IntoEdgeSource, IntoRoute, Route, RouteTarget,
+    SyncCommandMarker, SyncNodeMarker, END, START,
 };
 pub use error::Error;
 pub use interrupt::{interrupt, interrupt_id, Interrupt, Resume, RunOutput};
 pub use messages::{add_messages, REMOVE_ALL_MESSAGES};
 pub use reducer::{CustomReducer, Field, Reducer};
-pub use runtime::{PendingTask, RunConfig, StateSnapshot, DEFAULT_RECURSION_LIMIT};
+pub use runtime::{
+    InvokeInput, PendingTask, RunConfig, RunInput, StateSnapshot, DEFAULT_RECURSION_LIMIT,
+};
 pub use state::{ChannelMap, GraphState, Write, RESERVED_NAMES};
 
 /// Version of `langgraph-core`.
