@@ -6,6 +6,27 @@ Crate versions stay `0.0.0` through milestone 12 and become `0.1.0` in milestone
 
 The looping-graph demo (`examples/looping_graph.rs`: a node updates a counter, a conditional edge loops until a limit, then `END`) lands in milestone 4. Until then, `examples/README.md` is only a pointer.
 
+## Status
+
+The owner paused this project after streaming. Milestones 0–10 are on `main`. The next thread should start at subgraphs. Milestones 11–13 are not started.
+
+| # | Milestone | Status |
+| --- | --- | --- |
+| 0 | Design docs, workspace scaffold, and CI | Merged in PR #1 |
+| 1 | State channels and reducers | Merged in PR #2 |
+| 2 | Message types and add_messages | Merged in PR #3 |
+| 3 | Graph builder and compile-time validation | Merged in PR #4 |
+| 4 | Pregel superstep runtime | Merged in PR #5 |
+| 5 | In-memory checkpointer | Merged in PR #6 |
+| 6 | SQLite checkpointer | Merged in PR #7 |
+| 7 | Interrupts and human-in-the-loop | Merged in PR #8 |
+| 8 | Send fan-out | Merged in PR #9 |
+| 9 | Command updates and dynamic goto | Merged in PR #10 |
+| 10 | Streaming | Merged in PR #11 |
+| 11 | Subgraphs | Not started |
+| 12 | LLM provider trait, mock model, and OpenAI feature | Not started |
+| 13 | Prebuilt ReAct tool-calling loop (also bumps the workspace to 0.1.0) | Not started |
+
 ## Milestones
 
 | # | Title | PR delivers |
