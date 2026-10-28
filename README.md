@@ -8,7 +8,7 @@ The design is in [ARCHITECTURE.md](ARCHITECTURE.md). The v0.1 pull-request seque
 
 ## Quickstart
 
-State channels and reducers are in the crates: `GraphState`, a JSON channel map, `u64` channel versions, and overwrite, append, and custom folds. The `langgraph` facade re-exports those types. The graph builder, Pregel execution, checkpointers, and the ReAct agent arrive in the later milestones in [ROADMAP.md](ROADMAP.md). This tree has no runnable graph example yet.
+State channels and reducers are in the crates: `GraphState`, a JSON channel map, `u64` channel versions, and overwrite, append, custom, and `add_messages` folds. The `langgraph` facade re-exports those types. The graph builder, Pregel execution, checkpointers, and the ReAct agent arrive in the later milestones in [ROADMAP.md](ROADMAP.md). This tree has no runnable graph example yet.
 
 Rust is pinned to stable 1.99.1 in `rust-toolchain.toml`. From a checkout:
 
@@ -16,7 +16,7 @@ Rust is pinned to stable 1.99.1 in `rust-toolchain.toml`. From a checkout:
 cargo test --workspace --all-targets
 ```
 
-That builds the workspace and runs the state-channel tests and the scaffold smoke tests.
+That builds the workspace and runs the state-channel tests, the message-reducer tests, and the scaffold smoke tests.
 
 GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` on every pull request and on pushes to `main`.
 

@@ -11,8 +11,9 @@ pub enum Error {
     /// A step's writes could not be folded into a channel.
     ///
     /// Overwrite channels reject a second write in the same step. Append
-    /// channels reject a value that is not a JSON array. A custom reducer
-    /// may return this variant itself.
+    /// channels reject a value that is not a JSON array. `AddMessages`
+    /// rejects a message list that cannot be merged, including a `remove`
+    /// of an unknown id. A custom reducer may return this variant itself.
     #[error("invalid update: {0}")]
     InvalidUpdate(String),
 
