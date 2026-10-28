@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use langgraph::{Error, Field, GraphBuilder, GraphState, Reducer, RunConfig, END, START};
+use langgraph::{
+    Error, Field, GraphBuilder, GraphState, Reducer, RunConfig, RunOutput, END, START,
+};
 use serde_json::Value;
 
 struct Counter {
@@ -88,9 +90,14 @@ async fn main() -> Result<(), Error> {
         .add_edge(START, "step")
         .add_conditional_edges("step", route);
     let graph = builder.compile()?;
-    let result = graph
+    let RunOutput::Finished { state: result } = graph
         .invoke(&Counter { n: 0, limit: 3 }, &RunConfig::default())
-        .await?;
+        .await?
+    else {
+        return Err(Error::GraphValidation(
+            "looping example did not finish".into(),
+        ));
+    };
     println!("counter reached {}", result.n);
     assert_eq!(result.n, 3);
     assert_eq!(result.limit, 3);

@@ -7,22 +7,25 @@
 //! and edges. [`GraphBuilder::compile`] checks that structure.
 //! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
 //! runtime. A checkpointer on [`RunConfig`] stores each superstep and can
-//! resume a thread. See the repository `ARCHITECTURE.md`.
+//! resume a thread. [`interrupt`] pauses a node until [`Resume`] supplies a
+//! value. See the repository `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
 mod builder;
 mod error;
+mod interrupt;
 mod messages;
 mod reducer;
 mod runtime;
 mod state;
 
 pub use builder::{
-    AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, IntoEdgeSource, IntoRoute, Route,
-    SyncNodeMarker, END, START,
+    AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, InterruptNodes, IntoEdgeSource,
+    IntoRoute, Route, SyncNodeMarker, END, START,
 };
 pub use error::Error;
+pub use interrupt::{interrupt, interrupt_id, Interrupt, Resume, RunOutput};
 pub use messages::{add_messages, REMOVE_ALL_MESSAGES};
 pub use reducer::{CustomReducer, Field, Reducer};
 pub use runtime::{PendingTask, RunConfig, StateSnapshot, DEFAULT_RECURSION_LIMIT};

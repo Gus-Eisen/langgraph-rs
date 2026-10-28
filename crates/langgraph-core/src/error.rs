@@ -5,7 +5,8 @@
 //! [`crate::CompiledGraph::invoke`] adds [`Error::UnknownNode`],
 //! [`Error::RecursionLimit`], [`Error::NoRuntime`], and [`Error::Node`].
 //! A configured checkpointer adds [`Error::MissingThreadId`] and
-//! [`Error::Checkpoint`].
+//! [`Error::Checkpoint`]. [`Error::GraphInterrupt`] is how [`crate::interrupt`]
+//! leaves a node; `invoke` does not return it.
 
 use thiserror::Error;
 
@@ -60,14 +61,27 @@ pub enum Error {
     #[error("node '{node}' failed: {message}")]
     Node { node: String, message: String },
 
-    /// A checkpointer is configured and the run has no thread id.
+    /// A checkpointer is required and the run cannot use one.
     ///
-    /// Checked before any node runs and before any checkpoint read. With no
+    /// A configured checkpointer with no thread id is this error, checked
+    /// before any node runs and before any checkpoint read. With no
     /// checkpointer, `thread_id` is ignored.
+    ///
+    /// [`crate::interrupt`] without a checkpointer is also this error. The
+    /// superstep does not commit. `interrupt_before` / `interrupt_after`
+    /// without a checkpointer are this error before any node runs.
     #[error("missing thread id")]
     MissingThreadId,
 
     /// The checkpointer failed, or the requested checkpoint does not exist.
     #[error("checkpoint: {0}")]
     Checkpoint(String),
+
+    /// [`crate::interrupt`] paused the node that returned this error.
+    ///
+    /// Node functions propagate it with `?`. [`crate::CompiledGraph::invoke`]
+    /// does not return it: a pause is
+    /// [`Ok`](Result::Ok)`(`[`crate::RunOutput::Interrupted`]`)`.
+    #[error("graph interrupt")]
+    GraphInterrupt,
 }
