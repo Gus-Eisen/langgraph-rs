@@ -1,0 +1,15 @@
+[package]
+name = "langgraph"
+description = "Facade for the langgraph-rs workspace. The graph API arrives in later milestones."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+langgraph-checkpoint = { workspace = true }
+langgraph-core = { workspace = true }
+langgraph-llm = { workspace = true }
+langgraph-prebuilt = { workspace = true }
