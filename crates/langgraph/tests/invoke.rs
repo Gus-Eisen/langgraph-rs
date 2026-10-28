@@ -66,9 +66,12 @@ async fn facade_invoke_runs_a_finished_graph() {
             }
         });
     let graph = builder.compile().expect("compile");
-    let result = graph
+    let langgraph::RunOutput::Finished { state: result } = graph
         .invoke(&Counter { n: 0 }, &langgraph::RunConfig::default())
         .await
-        .expect("invoke");
+        .expect("invoke")
+    else {
+        panic!("expected Finished");
+    };
     assert_eq!(result.n, 2);
 }

@@ -8,7 +8,7 @@ The design is in [ARCHITECTURE.md](ARCHITECTURE.md). The v0.1 pull-request seque
 
 ## Quickstart
 
-State channels, reducers, the graph builder, and the Pregel runtime are in the crates. `GraphState` is a JSON channel map with `u64` versions and overwrite, append, custom, and `add_messages` folds. `GraphBuilder` records sync and async nodes, ordinary edges, waiting edges, and conditional routers. `compile` checks that structure. `CompiledGraph::invoke` runs supersteps on the current tokio runtime. `InMemorySaver` checkpoints a thread: a later `invoke` with the same `thread_id` merges its input into the stored channels and resumes. `SqliteSaver::open` stores those same checkpoints in a SQLite file. Interrupts and the ReAct agent arrive in the later milestones in [ROADMAP.md](ROADMAP.md). The looping graph is `examples/looping_graph.rs`:
+State channels, reducers, the graph builder, and the Pregel runtime are in the crates. `GraphState` is a JSON channel map with `u64` versions and overwrite, append, custom, and `add_messages` folds. `GraphBuilder` records sync and async nodes, ordinary edges, waiting edges, and conditional routers. `compile` checks that structure. `CompiledGraph::invoke` runs supersteps on the current tokio runtime and returns `RunOutput`. `interrupt`, `interrupt_before`, and `interrupt_after` pause a run; `Resume` continues it. `InMemorySaver` checkpoints a thread: a later `invoke` with the same `thread_id` merges its input into the stored channels and resumes. `SqliteSaver::open` stores those same checkpoints in a SQLite file. The ReAct agent arrives in a later milestone in [ROADMAP.md](ROADMAP.md). The looping graph is `examples/looping_graph.rs`:
 
 ```bash
 cargo run --example looping_graph

@@ -2,10 +2,11 @@
 //!
 //! This crate is the public facade. It re-exports state channels, reducers,
 //! `add_messages`, the graph builder, Pregel `invoke`, and the checkpointers.
-//! `compile` checks a graph. `CompiledGraph::invoke` runs it. `InMemorySaver`
-//! keeps a thread in memory. `SqliteSaver::open` keeps the same checkpoints
-//! in a SQLite file. The prebuilt agent is a later milestone. See the
-//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
+//! `compile` checks a graph. `CompiledGraph::invoke` runs it and returns
+//! [`RunOutput`]. `interrupt` pauses a node until [`Resume`] supplies a
+//! value. `InMemorySaver` keeps a thread in memory. `SqliteSaver::open`
+//! keeps the same checkpoints in a SQLite file. The prebuilt agent is a
+//! later milestone. See the repository `ROADMAP.md` and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
@@ -15,10 +16,11 @@ pub use langgraph_checkpoint::{
     InMemorySaver, PendingWrite, SqliteSaver,
 };
 pub use langgraph_core::{
-    add_messages, AsyncNodeMarker, ChannelMap, CompiledGraph, CustomReducer, EdgeSource, Error,
-    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, PendingTask, Reducer, Route,
-    RunConfig, StateSnapshot, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END,
-    REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
+    add_messages, interrupt, interrupt_id, AsyncNodeMarker, ChannelMap, CompiledGraph,
+    CustomReducer, EdgeSource, Error, Field, GraphBuilder, GraphState, Interrupt, InterruptNodes,
+    IntoEdgeSource, IntoRoute, PendingTask, Reducer, Resume, Route, RunConfig, RunOutput,
+    StateSnapshot, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES,
+    RESERVED_NAMES, START,
 };
 
 /// Version of this facade crate.
@@ -75,6 +77,22 @@ mod tests {
         fn assert_saver<T: crate::Checkpointer>() {}
         assert_saver::<crate::InMemorySaver>();
         assert_saver::<crate::SqliteSaver>();
+    }
+
+    #[test]
+    fn facade_reexports_interrupt_types() {
+        assert_eq!(
+            crate::interrupt(serde_json::json!(null)),
+            Err(crate::Error::MissingThreadId)
+        );
+        let _id = crate::interrupt_id;
+        let _nodes = crate::InterruptNodes::none();
+        let _resume = crate::Resume::Value(serde_json::json!(1));
+        let output = crate::RunOutput::Finished { state: () };
+        match output {
+            crate::RunOutput::Finished { state } => assert_eq!(state, ()),
+            crate::RunOutput::Interrupted { .. } => panic!("expected Finished"),
+        }
     }
 
     #[test]

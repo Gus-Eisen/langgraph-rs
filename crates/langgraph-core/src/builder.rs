@@ -431,13 +431,15 @@ impl<S: GraphState> fmt::Debug for ConditionalEdge<S> {
 ///
 /// [`GraphBuilder::compile`] produces this. [`CompiledGraph::invoke`] runs it
 /// on the current tokio runtime. A checkpointer is set on the run config,
-/// not on the graph. There are no interrupt breakpoints.
+/// not on the graph. Breakpoints are [`GraphBuilder::compile_with`].
 pub struct CompiledGraph<S: GraphState> {
     /// Nodes in registration order. `Arc` so a superstep can move each node
     /// onto `spawn_blocking` or a runtime task without borrowing the graph.
     pub(crate) nodes: Vec<(String, Arc<dyn InvokeNode<S>>)>,
     pub(crate) edges: Vec<Edge>,
     pub(crate) conditional_edges: Vec<ConditionalEdge<S>>,
+    pub(crate) interrupt_before: InterruptSet,
+    pub(crate) interrupt_after: InterruptSet,
 }
 
 impl<S: GraphState> fmt::Debug for CompiledGraph<S> {
@@ -447,7 +449,75 @@ impl<S: GraphState> fmt::Debug for CompiledGraph<S> {
             .field("nodes", &node_names(&self.nodes))
             .field("edges", &self.edges)
             .field("conditional_edges", &self.conditional_edges)
+            .field("interrupt_before", &self.interrupt_before)
+            .field("interrupt_after", &self.interrupt_after)
             .finish()
+    }
+}
+
+/// Nodes that pause at [`GraphBuilder::compile_with`].
+///
+/// [`InterruptNodes::All`] is every registered node. [`InterruptNodes::Nodes`]
+/// is those names. An empty list pauses nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptNodes {
+    /// Pause at every registered node.
+    All,
+    /// Pause at these node names.
+    Nodes(Vec<String>),
+}
+
+impl InterruptNodes {
+    /// No breakpoints.
+    pub const fn none() -> Self {
+        Self::Nodes(Vec::new())
+    }
+}
+
+impl From<&str> for InterruptNodes {
+    fn from(name: &str) -> Self {
+        Self::Nodes(vec![name.to_string()])
+    }
+}
+
+impl From<&[&str]> for InterruptNodes {
+    fn from(names: &[&str]) -> Self {
+        Self::Nodes(names.iter().map(|name| (*name).to_string()).collect())
+    }
+}
+
+impl<const N: usize> From<[&str; N]> for InterruptNodes {
+    fn from(names: [&str; N]) -> Self {
+        Self::Nodes(names.into_iter().map(str::to_string).collect())
+    }
+}
+
+impl From<Vec<String>> for InterruptNodes {
+    fn from(names: Vec<String>) -> Self {
+        Self::Nodes(names)
+    }
+}
+
+/// Breakpoints after compile has checked the names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptSet {
+    All,
+    Named(BTreeSet<String>),
+}
+
+impl InterruptSet {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Named(names) => names.contains(name),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Named(names) => names.is_empty(),
+        }
     }
 }
 
@@ -572,8 +642,9 @@ impl<S: GraphState> GraphBuilder<S> {
 
     /// Check the recorded graph and return it.
     ///
-    /// This does not run nodes or routers. There is no checkpointer parameter
-    /// and no interrupt breakpoint parameter.
+    /// This does not run nodes or routers. There is no checkpointer parameter.
+    /// There are no breakpoints. Use [`Self::compile_with`] to pause before
+    /// or after nodes.
     ///
     /// Compile rejects:
     ///
@@ -592,6 +663,24 @@ impl<S: GraphState> GraphBuilder<S> {
     /// reducers on one field are the same kind: function pointers are not
     /// compared, and the duplicate name is still rejected.
     pub fn compile(self) -> Result<CompiledGraph<S>, Error> {
+        self.compile_with(InterruptNodes::none(), InterruptNodes::none())
+    }
+
+    /// [`Self::compile`] with breakpoints.
+    ///
+    /// `interrupt_before` pauses before those nodes run. `interrupt_after`
+    /// pauses after the superstep that ran them has committed. Neither
+    /// breakpoint needs a resume value. A name that is not a registered node
+    /// is [`Error::GraphValidation`]. [`InterruptNodes::All`] is every
+    /// registered node.
+    ///
+    /// `invoke` with a breakpoint and no checkpointer is
+    /// [`Error::MissingThreadId`] before any node runs.
+    pub fn compile_with(
+        self,
+        interrupt_before: impl Into<InterruptNodes>,
+        interrupt_after: impl Into<InterruptNodes>,
+    ) -> Result<CompiledGraph<S>, Error> {
         validate_schema::<S>()?;
         let node_names = validate_nodes(&self.nodes)?;
         validate_edges(&self.edges, &node_names)?;
@@ -599,6 +688,8 @@ impl<S: GraphState> GraphBuilder<S> {
         if !leaves_start(&self.edges, &conditional_edges) {
             return Err(Error::GraphValidation("START has no outgoing edge".into()));
         }
+        let interrupt_before = resolve_interrupts(interrupt_before.into(), &node_names)?;
+        let interrupt_after = resolve_interrupts(interrupt_after.into(), &node_names)?;
         Ok(CompiledGraph {
             nodes: self
                 .nodes
@@ -607,7 +698,27 @@ impl<S: GraphState> GraphBuilder<S> {
                 .collect(),
             edges: self.edges,
             conditional_edges,
+            interrupt_before,
+            interrupt_after,
         })
+    }
+}
+
+fn resolve_interrupts(spec: InterruptNodes, known: &BTreeSet<&str>) -> Result<InterruptSet, Error> {
+    match spec {
+        InterruptNodes::All => Ok(InterruptSet::All),
+        InterruptNodes::Nodes(names) => {
+            let mut set = BTreeSet::new();
+            for name in names {
+                if !known.contains(name.as_str()) {
+                    return Err(Error::GraphValidation(format!(
+                        "interrupt node '{name}' is not in the graph"
+                    )));
+                }
+                set.insert(name);
+            }
+            Ok(InterruptSet::Named(set))
+        }
     }
 }
 
@@ -1400,5 +1511,35 @@ mod tests {
         let compiled = builder.compile().expect("both edge kinds");
         assert_eq!(compiled.edges.len(), 3);
         assert_eq!(compiled.conditional_edges.len(), 1);
+    }
+
+    #[test]
+    fn compile_with_rejects_an_unknown_interrupt_node_and_accepts_all() {
+        let mut unknown = GraphBuilder::<Count>::new();
+        unknown
+            .add_node("a", panic_node)
+            .add_edge(START, "a")
+            .add_edge("a", END);
+        let error = unknown
+            .compile_with(["missing"], InterruptNodes::none())
+            .expect_err("unknown interrupt");
+        match error {
+            Error::GraphValidation(message) => {
+                assert!(message.contains("missing"), "{message}");
+                assert!(message.contains("interrupt"), "{message}");
+            }
+            other => panic!("expected GraphValidation, got {other:?}"),
+        }
+
+        let mut all = GraphBuilder::<Count>::new();
+        all.add_node("a", panic_node)
+            .add_edge(START, "a")
+            .add_edge("a", END);
+        let compiled = all
+            .compile_with(InterruptNodes::All, ["a"])
+            .expect("all nodes");
+        assert!(matches!(compiled.interrupt_before, InterruptSet::All));
+        assert!(compiled.interrupt_after.contains("a"));
+        assert!(!compiled.interrupt_before.is_empty());
     }
 }

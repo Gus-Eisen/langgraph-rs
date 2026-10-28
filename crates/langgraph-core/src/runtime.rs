@@ -7,18 +7,27 @@
 //! `branch:{edge}:{dest}` counts conditional selections of `dest`.
 //! `versions_seen` maps a node to the control-channel versions it has
 //! already consumed. A checkpointer persists that map with the channel
-//! values so a later invoke can resume.
+//! values so a later invoke can resume. [`crate::interrupt`] pauses a task.
+//! Finished siblings keep their writes in `put_writes` until the superstep
+//! commits.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use langgraph_checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointSource, CheckpointTuple,
-    Checkpointer,
+    Checkpointer, PendingWrite,
 };
+use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
-use crate::builder::{ConditionalEdge, Edge, EdgeSource, InvokeNode};
+use crate::builder::{ConditionalEdge, Edge, EdgeSource, InterruptSet, InvokeNode};
+use crate::interrupt::{
+    dynamic_interrupts, has_dynamic_interrupt, is_breakpoint_marker, is_pause, scope_task,
+    stored_resume, task_done, task_interrupted, with_thread_frame, FrameHandle, Interrupt,
+    InterruptFrame, Resume, RunOutput, TaskResume, BREAKPOINT_TASK, CHANNEL_INTERRUPT,
+    CHANNEL_RESUME, CHANNEL_TASKS, INTERRUPT_SEEN,
+};
 use crate::state::{ChannelMap, Write};
 use crate::{Error, GraphState, END, START};
 
@@ -38,7 +47,9 @@ pub const DEFAULT_RECURSION_LIMIT: u32 = 25;
 ///
 /// With no checkpointer, `thread_id` and `checkpoint_id` are ignored and
 /// state lives only for that call. A checkpointer without a thread id is
-/// [`Error::MissingThreadId`] before any node runs.
+/// [`Error::MissingThreadId`] before any node runs. [`RunConfig::resume`]
+/// continues a pause. When it is set on a loaded checkpoint, `input` is not
+/// applied as channel writes.
 #[derive(Clone)]
 pub struct RunConfig {
     recursion_limit: u32,
@@ -46,6 +57,7 @@ pub struct RunConfig {
     checkpoint_ns: String,
     checkpoint_id: Option<String>,
     checkpointer: Option<Arc<dyn Checkpointer>>,
+    resume: Option<Resume>,
 }
 
 impl RunConfig {
@@ -57,6 +69,7 @@ impl RunConfig {
             checkpoint_ns: String::new(),
             checkpoint_id: None,
             checkpointer: None,
+            resume: None,
         }
     }
 
@@ -93,6 +106,16 @@ impl RunConfig {
         self
     }
 
+    /// Value that fills the next unanswered [`crate::interrupt`] call.
+    ///
+    /// [`Resume::Value`] fills one call. [`Resume::Map`] fills the call with
+    /// that id. A loaded checkpoint does not also apply `input` when this is
+    /// set. A resume value with no checkpointer is [`Error::MissingThreadId`].
+    pub fn resume(mut self, resume: Resume) -> Self {
+        self.resume = Some(resume);
+        self
+    }
+
     /// Superstep budget stored on this config.
     pub const fn get_recursion_limit(&self) -> u32 {
         self.recursion_limit
@@ -119,6 +142,11 @@ impl RunConfig {
     /// Saver stored on this config.
     pub fn get_checkpointer(&self) -> Option<&Arc<dyn Checkpointer>> {
         self.checkpointer.as_ref()
+    }
+
+    /// Resume value stored on this config.
+    pub fn get_resume(&self) -> Option<&Resume> {
+        self.resume.as_ref()
     }
 
     /// Thread, namespace, and checkpoint id for a saver call.
@@ -150,6 +178,7 @@ impl std::fmt::Debug for RunConfig {
             .field("checkpoint_ns", &self.checkpoint_ns)
             .field("checkpoint_id", &self.checkpoint_id)
             .field("checkpointer", &self.checkpointer.as_ref().map(|_| "saver"))
+            .field("resume", &self.resume)
             .finish()
     }
 }
@@ -160,6 +189,7 @@ impl PartialEq for RunConfig {
             && self.thread_id == other.thread_id
             && self.checkpoint_ns == other.checkpoint_ns
             && self.checkpoint_id == other.checkpoint_id
+            && self.resume == other.resume
             && match (&self.checkpointer, &other.checkpointer) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -167,8 +197,6 @@ impl PartialEq for RunConfig {
             }
     }
 }
-
-impl Eq for RunConfig {}
 
 impl Default for RunConfig {
     fn default() -> Self {
@@ -181,13 +209,14 @@ where
     S: GraphState + Send + Sync + 'static,
     S::Update: Send + 'static,
 {
-    /// Run the graph to completion on the current tokio runtime.
+    /// Run the graph until it finishes or pauses.
     ///
     /// `input` is written as channel updates attributed to [`START`], through
     /// the normal reducers. That write is not a superstep. With no
     /// checkpointer this is the whole state of a fresh run: the map starts
-    /// empty, then the input is folded in. A later saver should load the
-    /// checkpoint's channels first and then apply these same writes.
+    /// empty, then the input is folded in. A loaded checkpoint receives the
+    /// same writes unless [`RunConfig::resume`] is set or the checkpoint is
+    /// already a pause. In those cases `input` is not applied.
     ///
     /// Scheduling uses control channels, not the user-channel versions. A
     /// normal edge fires after its source completes. [`START`] fires the
@@ -206,41 +235,60 @@ where
     ///
     /// The barrier folds the step's writes in `(task_path, task_id, write_index)`
     /// order. `task_path` is empty at the root. `task_id` is the node name.
-    /// A task [`Err`](Result::Err) becomes [`Error::Node`]: the other tasks
+    /// A task [`Err`](Result::Err) fails the superstep: the other tasks
     /// are joined, and the step commits nothing. Two overwrite writes in one
     /// step are [`Error::InvalidUpdate`] and also commit nothing.
+    /// [`crate::interrupt`] without a checkpointer is [`Error::MissingThreadId`]
+    /// and that step does not commit either.
     ///
-    /// The recursion limit counts supersteps. The run executes at most
-    /// `config`'s limit and returns [`Error::RecursionLimit`] before starting
-    /// the next one. Routers are not a separate superstep.
+    /// `interrupt_before` pauses before a matching node runs.
+    /// `interrupt_after` pauses after the superstep that ran a matching node
+    /// has committed. Neither breakpoint carries a resume value. A graph
+    /// compiled with either breakpoint and invoked with no checkpointer
+    /// returns [`Error::MissingThreadId`] before any node runs.
     ///
-    /// Polling this future outside tokio returns [`Error::NoRuntime`]. A
-    /// finished run returns the committed state. There is no `stream` method,
-    /// interrupt, `Send`, or `Command` on this call.
+    /// When a task calls [`crate::interrupt`] and that call has no resume
+    /// value yet, sibling tasks still finish. Their writes are stored with
+    /// `put_writes` and are not applied yet. On resume, finished tasks are
+    /// not executed again. Their pending writes are replayed. The interrupted
+    /// task runs from the start. Channel values commit only when every task
+    /// in the superstep has finished without a new interrupt. The result is
+    /// [`RunOutput::Interrupted`], not an error.
+    ///
+    /// The recursion limit counts committed supersteps. The run executes at
+    /// most `config`'s limit and returns [`Error::RecursionLimit`] before
+    /// starting the next one. Routers are not a separate superstep. A
+    /// breakpoint pause does not count as a superstep.
+    ///
+    /// Polling this future outside tokio returns [`Error::NoRuntime`]. There
+    /// is no `stream` method, `Send`, or `Command` on this call.
     ///
     /// With a checkpointer, the call loads `config`'s checkpoint first
     /// (`checkpoint_id` when set, otherwise the latest in the thread and
-    /// namespace). Input writes are then reduced into those channels. An
-    /// `add_messages` field appends. An overwrite field replaces. That
-    /// application is not a superstep.
-    ///
-    /// If the loaded checkpoint still has nodes scheduled, those nodes run.
-    /// The call does not start again from [`START`]. If nothing is scheduled,
-    /// or there is no checkpoint yet, `done:__start__` increments and the
-    /// entry nodes run on the merged state. An input checkpoint (`source:
-    /// Input`, step `-1` on a fresh thread) is stored after that preparation
-    /// and before the first superstep. Each committed superstep stores a
-    /// `Loop` checkpoint before the next superstep starts. `put` finishes
-    /// before that next superstep.
+    /// namespace). If the loaded checkpoint still has nodes scheduled, those
+    /// nodes run. The call does not start again from [`START`]. If nothing is
+    /// scheduled, or there is no checkpoint yet, `done:__start__` increments
+    /// and the entry nodes run on the merged state. An input checkpoint
+    /// (`source: Input`, step `-1` on a fresh thread) is stored after that
+    /// preparation and before the first superstep, except when this call is
+    /// continuing a pause. Each committed superstep stores a `Loop`
+    /// checkpoint before the next superstep starts.
     ///
     /// A `checkpoint_id` loads that snapshot. The following `put` creates a
     /// new checkpoint whose parent is the selected id. Older checkpoints,
     /// including the previous tip, stay as they were.
-    pub async fn invoke(&self, input: &S, config: &RunConfig) -> Result<S, Error> {
+    pub async fn invoke(&self, input: &S, config: &RunConfig) -> Result<RunOutput<S>, Error> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(Error::NoRuntime);
         }
         if config.checkpointer.is_some() && config.get_thread_id().is_none() {
+            return Err(Error::MissingThreadId);
+        }
+        let breakpoints = !self.interrupt_before.is_empty() || !self.interrupt_after.is_empty();
+        if breakpoints && config.checkpointer.is_none() {
+            return Err(Error::MissingThreadId);
+        }
+        if config.resume.is_some() && config.checkpointer.is_none() {
             return Err(Error::MissingThreadId);
         }
         if config.recursion_limit < 1 {
@@ -259,6 +307,7 @@ where
         let mut step = -1i64;
         let mut parent_id: Option<String> = None;
         let mut loaded = false;
+        let mut carried_writes: Vec<PendingWrite> = Vec::new();
         if let Some(saver) = saver.as_ref() {
             let lookup = config.checkpoint_config()?;
             if let Some(tuple) = saver.get_tuple(&lookup).await.map_err(checkpoint_error)? {
@@ -267,67 +316,30 @@ where
                 control = restored.1;
                 step = tuple.metadata.step;
                 parent_id = Some(tuple.checkpoint.id);
+                carried_writes = tuple.pending_writes;
                 loaded = true;
             }
         }
 
-        let writes = input_writes(input)?;
-        let input_channels = channel_names(&writes);
-        channels.apply_writes(&writes)?;
-
-        let pending = schedule(&self.edges, &nodes, &control);
-        if !loaded || pending.is_empty() {
-            // A fresh run, a finished thread, or a call with no saver.
-            // Entry edges read the new START completion.
-            control.bump_done(START);
-            if conditionals.iter().any(|edge| edge.from == START) {
-                let state = channels.to_state::<S>()?;
-                let routes = route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
-                control.apply_routes(&routes);
+        let continuing_pause = is_pause(&carried_writes);
+        let skip_input = loaded && (continuing_pause || config.resume.is_some());
+        if skip_input {
+            carried_writes.retain(|write| !is_breakpoint_marker(write));
+        } else {
+            let writes = input_writes(input)?;
+            let input_channels = channel_names(&writes);
+            channels.apply_writes(&writes)?;
+            let pending = schedule(&self.edges, &nodes, &control);
+            if !loaded || pending.is_empty() {
+                control.bump_done(START);
+                if conditionals.iter().any(|edge| edge.from == START) {
+                    let state = channels.to_state::<S>()?;
+                    let routes =
+                        route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
+                    control.apply_routes(&routes);
+                }
             }
-        }
-
-        if let Some(saver) = saver.as_ref() {
-            parent_id = Some(
-                save_checkpoint(
-                    saver.as_ref(),
-                    config,
-                    parent_id.as_deref(),
-                    SavedStep {
-                        channels: &channels,
-                        control: &control,
-                        updated: &input_channels,
-                        source: CheckpointSource::Input,
-                        step,
-                    },
-                )
-                .await?
-                .checkpoint_id
-                .ok_or_else(|| Error::Checkpoint("saver did not return a checkpoint id".into()))?,
-            );
-        }
-
-        let mut completed_supersteps = 0u32;
-        loop {
-            let scheduled = schedule(&self.edges, &nodes, &control);
-            if scheduled.is_empty() {
-                return channels.to_state();
-            }
-            if completed_supersteps == config.recursion_limit {
-                return Err(Error::RecursionLimit(config.recursion_limit));
-            }
-            let updated = run_superstep(
-                &mut channels,
-                &mut control,
-                &nodes,
-                &conditionals,
-                &known,
-                scheduled,
-            )
-            .await?;
-            completed_supersteps += 1;
             if let Some(saver) = saver.as_ref() {
-                step += 1;
                 parent_id = Some(
                     save_checkpoint(
                         saver.as_ref(),
@@ -336,8 +348,8 @@ where
                         SavedStep {
                             channels: &channels,
                             control: &control,
-                            updated: &updated,
-                            source: CheckpointSource::Loop,
+                            updated: &input_channels,
+                            source: CheckpointSource::Input,
                             step,
                         },
                     )
@@ -349,13 +361,140 @@ where
                 );
             }
         }
+
+        let mut completed_supersteps = 0u32;
+        loop {
+            let scheduled = schedule(&self.edges, &nodes, &control);
+            if scheduled.is_empty() {
+                return Ok(RunOutput::Finished {
+                    state: channels.to_state()?,
+                });
+            }
+            if completed_supersteps == config.recursion_limit {
+                return Err(Error::RecursionLimit(config.recursion_limit));
+            }
+            let names = scheduled
+                .iter()
+                .map(|task| task.name.clone())
+                .collect::<Vec<_>>();
+            if !has_dynamic_interrupt(&carried_writes)
+                && interrupts_match(&self.interrupt_before, &names, &channels, &control)
+            {
+                mark_interrupt_seen(&mut control, &channels);
+                if let Some(saver) = saver.as_ref() {
+                    step += 1;
+                    let saved = save_checkpoint(
+                        saver.as_ref(),
+                        config,
+                        parent_id.as_deref(),
+                        SavedStep {
+                            channels: &channels,
+                            control: &control,
+                            updated: &[],
+                            source: CheckpointSource::Loop,
+                            step,
+                        },
+                    )
+                    .await?;
+                    put_pending(saver.as_ref(), &saved, &breakpoint_writes()).await?;
+                }
+                return Ok(RunOutput::Interrupted {
+                    state: channels.to_state()?,
+                    interrupts: Vec::new(),
+                });
+            }
+            match run_superstep(
+                &mut channels,
+                &mut control,
+                scheduled,
+                SuperstepInput {
+                    nodes: &nodes,
+                    conditionals: &conditionals,
+                    known: &known,
+                    pending: &carried_writes,
+                    config,
+                },
+            )
+            .await?
+            {
+                StepOutcome::Done(done) => {
+                    carried_writes.clear();
+                    completed_supersteps += 1;
+                    let pause_after = interrupts_match(
+                        &self.interrupt_after,
+                        &done.finished,
+                        &channels,
+                        &control,
+                    );
+                    if pause_after {
+                        mark_interrupt_seen(&mut control, &channels);
+                    }
+                    if let Some(saver) = saver.as_ref() {
+                        step += 1;
+                        let saved = save_checkpoint(
+                            saver.as_ref(),
+                            config,
+                            parent_id.as_deref(),
+                            SavedStep {
+                                channels: &channels,
+                                control: &control,
+                                updated: &done.updated,
+                                source: CheckpointSource::Loop,
+                                step,
+                            },
+                        )
+                        .await?;
+                        parent_id = Some(saved.checkpoint_id.clone().ok_or_else(|| {
+                            Error::Checkpoint("saver did not return a checkpoint id".into())
+                        })?);
+                        if pause_after {
+                            put_pending(saver.as_ref(), &saved, &breakpoint_writes()).await?;
+                        }
+                    }
+                    if pause_after {
+                        return Ok(RunOutput::Interrupted {
+                            state: channels.to_state()?,
+                            interrupts: Vec::new(),
+                        });
+                    }
+                }
+                StepOutcome::Paused {
+                    interrupts,
+                    pending,
+                } => {
+                    if let Some(saver) = saver.as_ref() {
+                        step += 1;
+                        let saved = save_checkpoint(
+                            saver.as_ref(),
+                            config,
+                            parent_id.as_deref(),
+                            SavedStep {
+                                channels: &channels,
+                                control: &control,
+                                updated: &[],
+                                source: CheckpointSource::Loop,
+                                step,
+                            },
+                        )
+                        .await?;
+                        put_pending(saver.as_ref(), &saved, &pending).await?;
+                    }
+                    return Ok(RunOutput::Interrupted {
+                        state: channels.to_state()?,
+                        interrupts,
+                    });
+                }
+            }
+        }
     }
 
     /// Load the checkpoint selected by `config`.
     ///
     /// The snapshot carries the channel values as `S`, the node names the
-    /// next superstep would run, the config for this checkpoint, the parent
-    /// config, and those pending nodes as tasks. `interrupts` is empty.
+    /// next superstep would still run, the config for this checkpoint, the
+    /// parent config, and those pending nodes as tasks. `interrupts` comes
+    /// from unanswered [`crate::interrupt`] calls stored on the checkpoint.
+    /// A finished sibling is not listed in `next`.
     ///
     /// No checkpointer is [`Error::Checkpoint`]. A checkpointer without a
     /// thread id is [`Error::MissingThreadId`]. A thread with no checkpoint
@@ -484,6 +623,7 @@ where
         let nodes = node_map(&self.nodes);
         let next = schedule(&self.edges, &nodes, &control)
             .into_iter()
+            .filter(|task| !task_done(&tuple.pending_writes, &task.name))
             .map(|task| task.name)
             .collect::<Vec<_>>();
         let tasks = next
@@ -500,7 +640,7 @@ where
             config: config.at_checkpoint(Some(tuple.checkpoint.id.clone())),
             parent_config,
             tasks,
-            interrupts: Vec::new(),
+            interrupts: dynamic_interrupts(&tuple.pending_writes)?,
             metadata: tuple.metadata.clone(),
         })
     }
@@ -519,8 +659,11 @@ pub struct StateSnapshot<S> {
     pub parent_config: Option<RunConfig>,
     /// One task per name in [`StateSnapshot::next`].
     pub tasks: Vec<PendingTask>,
-    /// Always empty. Interrupts are a later milestone.
-    pub interrupts: Vec<serde_json::Value>,
+    /// Unanswered [`crate::interrupt`] calls stored on this checkpoint.
+    ///
+    /// Empty when the checkpoint is not paused inside a node. Breakpoints do
+    /// not add an entry.
+    pub interrupts: Vec<Interrupt>,
     /// Source, step, and parent ids stored with the checkpoint.
     pub metadata: CheckpointMetadata,
 }
@@ -603,6 +746,7 @@ struct TaskOutput {
     name: String,
     writes: Vec<Write>,
     routed: Vec<RoutePush>,
+    pause: Option<TaskPause>,
 }
 
 struct StepShared<S: GraphState> {
@@ -797,6 +941,7 @@ fn after_update<S: GraphState>(
         name,
         writes,
         routed,
+        pause: None,
     })
 }
 
@@ -819,11 +964,30 @@ fn drive_sync<S: GraphState>(node: &dyn InvokeNode<S>, state: &S) -> Result<S::U
     }
 }
 
+struct TaskPause {
+    interrupt: Interrupt,
+    resume_values: Vec<Value>,
+}
+
+struct CommittedStep {
+    updated: Vec<String>,
+    finished: Vec<String>,
+}
+
+enum StepOutcome {
+    Done(CommittedStep),
+    Paused {
+        interrupts: Vec<Interrupt>,
+        pending: BTreeMap<String, Vec<PendingWrite>>,
+    },
+}
+
 fn spawn_task<S>(
     node: Arc<dyn InvokeNode<S>>,
     snapshot: Arc<S>,
     shared: Arc<StepShared<S>>,
     name: String,
+    frame: FrameHandle,
 ) -> JoinHandle<Result<TaskOutput, Error>>
 where
     S: GraphState + Send + Sync + 'static,
@@ -831,74 +995,170 @@ where
 {
     if node.is_sync() {
         tokio::task::spawn_blocking(move || {
-            let update = match drive_sync(node.as_ref(), snapshot.as_ref()) {
-                Ok(update) => update,
-                Err(error) => return Err(node_failure(&name, error)),
-            };
-            after_update(name, update, shared.as_ref())
+            with_thread_frame(Arc::clone(&frame), || {
+                let update = drive_sync(node.as_ref(), snapshot.as_ref());
+                finish_task(name, update, frame.as_ref(), shared.as_ref())
+            })
         })
     } else {
-        tokio::spawn(async move {
-            let update = match node.call(snapshot.as_ref()).await {
-                Ok(update) => update,
-                Err(error) => return Err(node_failure(&name, error)),
-            };
-            after_update(name, update, shared.as_ref())
-        })
+        tokio::spawn(scope_task(Arc::clone(&frame), async move {
+            let update = node.call(snapshot.as_ref()).await;
+            finish_task(name, update, frame.as_ref(), shared.as_ref())
+        }))
     }
+}
+
+fn finish_task<S: GraphState>(
+    name: String,
+    update: Result<S::Update, Error>,
+    frame: &InterruptFrame,
+    shared: &StepShared<S>,
+) -> Result<TaskOutput, Error> {
+    if let Some(interrupt) = frame.take_raised() {
+        return Ok(TaskOutput {
+            name,
+            writes: Vec::new(),
+            routed: Vec::new(),
+            pause: Some(TaskPause {
+                interrupt,
+                resume_values: frame.resume_values(),
+            }),
+        });
+    }
+    match update {
+        Ok(update) => after_update(name, update, shared),
+        Err(Error::MissingThreadId) => Err(Error::MissingThreadId),
+        Err(error) => Err(node_failure(&name, error)),
+    }
+}
+
+struct SuperstepInput<'a, S: GraphState> {
+    nodes: &'a BTreeMap<String, Arc<dyn InvokeNode<S>>>,
+    conditionals: &'a Arc<Vec<ConditionalEdge<S>>>,
+    known: &'a Arc<BTreeSet<String>>,
+    pending: &'a [PendingWrite],
+    config: &'a RunConfig,
 }
 
 async fn run_superstep<S>(
     channels: &mut ChannelMap,
     control: &mut Control,
-    nodes: &BTreeMap<String, Arc<dyn InvokeNode<S>>>,
-    conditionals: &Arc<Vec<ConditionalEdge<S>>>,
-    known: &Arc<BTreeSet<String>>,
     scheduled: Vec<Scheduled>,
-) -> Result<Vec<String>, Error>
+    input: SuperstepInput<'_, S>,
+) -> Result<StepOutcome, Error>
 where
     S: GraphState + Send + Sync + 'static,
     S::Update: Send + 'static,
 {
+    let SuperstepInput {
+        nodes,
+        conditionals,
+        known,
+        pending,
+        config,
+    } = input;
     let snapshot = Arc::new(channels.to_state::<S>()?);
     let shared = Arc::new(StepShared {
         base: channels.clone(),
         conditionals: Arc::clone(conditionals),
         known: Arc::clone(known),
     });
+    let (null_value, resume_map) = resume_parts(config.get_resume());
+    let run_names = scheduled
+        .iter()
+        .filter(|task| !task_done(pending, &task.name))
+        .map(|task| task.name.as_str())
+        .collect::<Vec<_>>();
+    let null_owner = null_resume_task(&run_names, pending, null_value.is_some());
 
-    let mut handles = Vec::with_capacity(scheduled.len());
+    let mut results = Vec::new();
+    let mut handles = Vec::new();
+    let mut handle_names = Vec::new();
     for task in &scheduled {
+        if task_done(pending, &task.name) {
+            let (writes, routed) = decode_replay(pending, &task.name)?;
+            results.push(TaskOutput {
+                name: task.name.clone(),
+                writes,
+                routed,
+                pause: None,
+            });
+            continue;
+        }
         let node = Arc::clone(nodes.get(&task.name).expect("scheduled node is registered"));
+        let answers = stored_resume(pending, &task.name)?;
+        let frame = InterruptFrame::new(TaskResume {
+            checkpoint_ns: config.get_checkpoint_ns().to_string(),
+            task_path: vec![task.name.clone()],
+            has_checkpointer: config.get_checkpointer().is_some(),
+            answers,
+            null_resume: if Some(task.name.as_str()) == null_owner {
+                null_value.clone()
+            } else {
+                None
+            },
+            resume_map: resume_map.clone(),
+        });
+        handle_names.push(task.name.clone());
         handles.push(spawn_task(
             node,
             Arc::clone(&snapshot),
             Arc::clone(&shared),
             task.name.clone(),
+            frame,
         ));
     }
 
-    let mut results = Vec::with_capacity(scheduled.len());
     let mut failures = Vec::new();
-    for (task, handle) in scheduled.iter().zip(handles) {
+    for (name, handle) in handle_names.into_iter().zip(handles) {
         match handle.await {
             Ok(Ok(output)) => results.push(output),
-            Ok(Err(error)) => failures.push((task.name.clone(), error)),
+            Ok(Err(error)) => failures.push((name, error)),
             Err(join_error) if join_error.is_panic() => {
                 std::panic::resume_unwind(join_error.into_panic());
             }
             Err(_) => failures.push((
-                task.name.clone(),
+                name.clone(),
                 Error::Node {
-                    node: task.name.clone(),
+                    node: name,
                     message: "task was cancelled".into(),
                 },
             )),
         }
     }
+    if failures
+        .iter()
+        .any(|(_, error)| matches!(error, Error::MissingThreadId))
+    {
+        return Err(Error::MissingThreadId);
+    }
     if !failures.is_empty() {
         failures.sort_by(|left, right| left.0.cmp(&right.0));
         return Err(failures.remove(0).1);
+    }
+
+    if results.iter().any(|result| result.pause.is_some()) {
+        let mut groups = BTreeMap::new();
+        let mut interrupts = Vec::new();
+        for result in &results {
+            if let Some(pause) = &result.pause {
+                interrupts.push(pause.interrupt.clone());
+                groups.insert(
+                    result.name.clone(),
+                    encode_interrupted(&result.name, &pause.interrupt, &pause.resume_values),
+                );
+            } else {
+                groups.insert(
+                    result.name.clone(),
+                    encode_finished(&result.name, &result.writes, &result.routed),
+                );
+            }
+        }
+        interrupts.sort_by(|left, right| left.id.cmp(&right.id));
+        return Ok(StepOutcome::Paused {
+            interrupts,
+            pending: groups,
+        });
     }
 
     results.sort_by(|left, right| left.name.cmp(&right.name));
@@ -915,7 +1175,199 @@ where
     for result in &results {
         control.apply_routes(&result.routed);
     }
-    Ok(channel_names(&writes))
+    Ok(StepOutcome::Done(CommittedStep {
+        updated: channel_names(&writes),
+        finished: scheduled.into_iter().map(|task| task.name).collect(),
+    }))
+}
+
+fn resume_parts(resume: Option<&Resume>) -> (Option<Value>, BTreeMap<String, Value>) {
+    match resume {
+        Some(Resume::Value(value)) => (Some(value.clone()), BTreeMap::new()),
+        Some(Resume::Map(map)) => (None, map.clone()),
+        None => (None, BTreeMap::new()),
+    }
+}
+
+fn null_resume_task<'a>(
+    to_run: &[&'a str],
+    pending: &[PendingWrite],
+    has_value: bool,
+) -> Option<&'a str> {
+    if !has_value {
+        return None;
+    }
+    let mut interrupted = to_run
+        .iter()
+        .copied()
+        .filter(|name| task_interrupted(pending, name))
+        .collect::<Vec<_>>();
+    if interrupted.is_empty() {
+        interrupted = to_run.to_vec();
+    }
+    interrupted.sort_unstable();
+    interrupted.first().copied()
+}
+
+fn interrupts_match(
+    set: &InterruptSet,
+    names: &[String],
+    channels: &ChannelMap,
+    control: &Control,
+) -> bool {
+    if !names.iter().any(|name| set.contains(name)) {
+        return false;
+    }
+    channels
+        .versions()
+        .into_iter()
+        .any(|(name, version)| version > control.seen_version(INTERRUPT_SEEN, &name))
+}
+
+fn mark_interrupt_seen(control: &mut Control, channels: &ChannelMap) {
+    control
+        .seen
+        .insert(INTERRUPT_SEEN.to_string(), channels.versions());
+}
+
+fn breakpoint_writes() -> BTreeMap<String, Vec<PendingWrite>> {
+    BTreeMap::from([(
+        BREAKPOINT_TASK.to_string(),
+        vec![PendingWrite {
+            task_id: BREAKPOINT_TASK.to_string(),
+            channel: CHANNEL_TASKS.to_string(),
+            value: json!({"status": "breakpoint"}),
+        }],
+    )])
+}
+
+async fn put_pending(
+    saver: &dyn Checkpointer,
+    saved: &CheckpointConfig,
+    groups: &BTreeMap<String, Vec<PendingWrite>>,
+) -> Result<(), Error> {
+    for (task_id, writes) in groups {
+        if writes.is_empty() {
+            continue;
+        }
+        saver
+            .put_writes(saved, writes, task_id)
+            .await
+            .map_err(checkpoint_error)?;
+    }
+    Ok(())
+}
+
+fn encode_finished(task_id: &str, writes: &[Write], routes: &[RoutePush]) -> Vec<PendingWrite> {
+    let mut pending = Vec::new();
+    for write in writes {
+        pending.push(PendingWrite {
+            task_id: task_id.to_string(),
+            channel: write.channel.clone(),
+            value: write.value.clone(),
+        });
+    }
+    pending.push(PendingWrite {
+        task_id: task_id.to_string(),
+        channel: CHANNEL_TASKS.to_string(),
+        value: json!({
+            "status": "done",
+            "routes": routes
+                .iter()
+                .map(|route| json!({
+                    "edge_index": route.edge_index,
+                    "destination": route.destination,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    });
+    pending
+}
+
+fn encode_interrupted(
+    task_id: &str,
+    interrupt: &Interrupt,
+    resume_values: &[Value],
+) -> Vec<PendingWrite> {
+    let mut pending = Vec::new();
+    if !resume_values.is_empty() {
+        pending.push(PendingWrite {
+            task_id: task_id.to_string(),
+            channel: CHANNEL_RESUME.to_string(),
+            value: Value::Array(resume_values.to_vec()),
+        });
+    }
+    pending.push(PendingWrite {
+        task_id: task_id.to_string(),
+        channel: CHANNEL_INTERRUPT.to_string(),
+        value: json!({
+            "id": interrupt.id,
+            "value": interrupt.value,
+        }),
+    });
+    pending
+}
+
+fn decode_replay(
+    pending: &[PendingWrite],
+    task_id: &str,
+) -> Result<(Vec<Write>, Vec<RoutePush>), Error> {
+    let mut writes = Vec::new();
+    let mut routes = Vec::new();
+    let mut saw_done = false;
+    for write in pending {
+        if write.task_id != task_id {
+            continue;
+        }
+        if write.channel == CHANNEL_TASKS {
+            saw_done = true;
+            routes = parse_routes(&write.value)?;
+            continue;
+        }
+        if write.channel == CHANNEL_RESUME || write.channel == CHANNEL_INTERRUPT {
+            continue;
+        }
+        let write_index = u64::try_from(writes.len())
+            .map_err(|_| Error::InvalidUpdate(format!("task '{task_id}' write index overflow")))?;
+        writes.push(Write {
+            channel: write.channel.clone(),
+            value: write.value.clone(),
+            task_path: Vec::new(),
+            task_id: task_id.to_string(),
+            write_index,
+        });
+    }
+    if !saw_done {
+        return Err(Error::Checkpoint(format!(
+            "task '{task_id}' is missing its pending result"
+        )));
+    }
+    Ok((writes, routes))
+}
+
+fn parse_routes(value: &Value) -> Result<Vec<RoutePush>, Error> {
+    let routes = value
+        .get("routes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Checkpoint("pending task result is missing routes".into()))?;
+    let mut parsed = Vec::with_capacity(routes.len());
+    for route in routes {
+        let edge_index = route
+            .get("edge_index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::Checkpoint("pending route is missing edge_index".into()))?;
+        let destination = route
+            .get("destination")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Checkpoint("pending route is missing destination".into()))?;
+        let edge_index = usize::try_from(edge_index)
+            .map_err(|_| Error::Checkpoint("pending route edge_index does not fit".into()))?;
+        parsed.push(RoutePush {
+            edge_index,
+            destination: destination.to_string(),
+        });
+    }
+    Ok(parsed)
 }
 
 fn require_runtime() -> Result<(), Error> {
@@ -1178,6 +1630,13 @@ mod tests {
         builder.compile().expect("compile")
     }
 
+    fn take_finished(output: crate::RunOutput<Sample>) -> Sample {
+        match output {
+            crate::RunOutput::Finished { state } => state,
+            crate::RunOutput::Interrupted { .. } => panic!("expected Finished"),
+        }
+    }
+
     fn assert_send<T: Send>(_: &T) {}
 
     #[test]
@@ -1265,10 +1724,12 @@ mod tests {
         });
         let mut input = sample(4);
         input.tag = "kept".to_string();
-        let result = graph
-            .invoke(&input, &RunConfig::new().recursion_limit(1))
-            .await
-            .expect("one superstep");
+        let result = take_finished(
+            graph
+                .invoke(&input, &RunConfig::new().recursion_limit(1))
+                .await
+                .expect("one superstep"),
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.count, 5);
         assert_eq!(result.tag, "kept");
@@ -1304,10 +1765,12 @@ mod tests {
                 .add_edge("high", END)
                 .add_edge("low", END);
         });
-        let result = graph
-            .invoke(&sample(2), &RunConfig::default())
-            .await
-            .expect("branch");
+        let result = take_finished(
+            graph
+                .invoke(&sample(2), &RunConfig::default())
+                .await
+                .expect("branch"),
+        );
         assert_eq!(result.tag, "took-high");
         assert_eq!(low_ran.load(Ordering::SeqCst), 0);
     }
@@ -1326,10 +1789,12 @@ mod tests {
                 )
                 .add_edge("high", END);
         });
-        let result = graph
-            .invoke(&sample(0), &RunConfig::default())
-            .await
-            .expect("path map");
+        let result = take_finished(
+            graph
+                .invoke(&sample(0), &RunConfig::default())
+                .await
+                .expect("path map"),
+        );
         assert_eq!(result.tag, "mapped");
     }
 
@@ -1386,10 +1851,12 @@ mod tests {
                 .add_edge("left", END)
                 .add_edge("right", END);
         });
-        let result = graph
-            .invoke(&sample(0), &RunConfig::default())
-            .await
-            .expect("fan out");
+        let result = take_finished(
+            graph
+                .invoke(&sample(0), &RunConfig::default())
+                .await
+                .expect("fan out"),
+        );
         assert_eq!(result.items, ["left".to_string(), "right".to_string()]);
     }
 
@@ -1437,10 +1904,12 @@ mod tests {
 
         let mut input = sample(0);
         input.items = vec!["seed".to_string()];
-        let result = graph
-            .invoke(&input, &RunConfig::default())
-            .await
-            .expect("parallel append");
+        let result = take_finished(
+            graph
+                .invoke(&input, &RunConfig::default())
+                .await
+                .expect("parallel append"),
+        );
         assert_eq!(order.lock().expect("lock").as_slice(), ["b", "a"]);
         assert_eq!(
             result.items,
@@ -1476,10 +1945,12 @@ mod tests {
         });
         let mut input = sample(0);
         input.items = vec!["seed".to_string()];
-        let result = graph
-            .invoke(&input, &RunConfig::default())
-            .await
-            .expect("isolated routers");
+        let result = take_finished(
+            graph
+                .invoke(&input, &RunConfig::default())
+                .await
+                .expect("isolated routers"),
+        );
         let seen = seen.lock().expect("lock");
         assert_eq!(
             seen.get("a").map(Vec::as_slice),
@@ -1511,22 +1982,26 @@ mod tests {
         });
         let mut input = sample(0);
         input.tag = "kept".to_string();
-        let result = graph
-            .invoke(&input, &RunConfig::default())
-            .await
-            .expect("cycle ends");
+        let result = take_finished(
+            graph
+                .invoke(&input, &RunConfig::default())
+                .await
+                .expect("cycle ends"),
+        );
         assert_eq!(result.count, 3);
         assert_eq!(result.tag, "kept");
 
-        let with_thread = graph
-            .invoke(
-                &input,
-                &RunConfig::new()
-                    .thread_id("ignored")
-                    .checkpoint_id("also-ignored"),
-            )
-            .await
-            .expect("thread id without a saver");
+        let with_thread = take_finished(
+            graph
+                .invoke(
+                    &input,
+                    &RunConfig::new()
+                        .thread_id("ignored")
+                        .checkpoint_id("also-ignored"),
+                )
+                .await
+                .expect("thread id without a saver"),
+        );
         assert_eq!(with_thread.count, 3);
         assert_eq!(with_thread.tag, "kept");
     }
@@ -1566,10 +2041,12 @@ mod tests {
                     }
                 });
         });
-        let finished = stopping
-            .invoke(&sample(0), &RunConfig::default())
-            .await
-            .expect("25 steps reach the limit value");
+        let finished = take_finished(
+            stopping
+                .invoke(&sample(0), &RunConfig::default())
+                .await
+                .expect("25 steps reach the limit value"),
+        );
         assert_eq!(finished.count, i64::from(DEFAULT_RECURSION_LIMIT));
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1724,10 +2201,12 @@ mod tests {
                 .add_edge(["a", "b"], "join")
                 .add_edge("join", END);
         });
-        let result = graph
-            .invoke(&sample(0), &RunConfig::default())
-            .await
-            .expect("waiting edge");
+        let result = take_finished(
+            graph
+                .invoke(&sample(0), &RunConfig::default())
+                .await
+                .expect("waiting edge"),
+        );
         assert_eq!(
             snapshots.lock().expect("lock").as_slice(),
             [vec!["a".to_string(), "b".to_string()]]
@@ -1756,10 +2235,12 @@ mod tests {
                 .add_edge(["a", "b"], "join")
                 .add_edge("join", END);
         });
-        let result = graph
-            .invoke(&sample(0), &RunConfig::default())
-            .await
-            .expect("parallel wait");
+        let result = take_finished(
+            graph
+                .invoke(&sample(0), &RunConfig::default())
+                .await
+                .expect("parallel wait"),
+        );
         assert_eq!(
             snapshots.lock().expect("lock").as_slice(),
             [vec!["a".to_string(), "b".to_string()]]

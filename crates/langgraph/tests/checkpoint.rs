@@ -158,6 +158,13 @@ fn compile(build: impl FnOnce(&mut GraphBuilder<Bundle>)) -> CompiledGraph<Bundl
     builder.compile().expect("compile")
 }
 
+fn take_finished(output: langgraph::RunOutput<Bundle>) -> Bundle {
+    match output {
+        langgraph::RunOutput::Finished { state } => state,
+        langgraph::RunOutput::Interrupted { .. } => panic!("expected Finished"),
+    }
+}
+
 fn saver_config(thread_id: &str) -> (Arc<dyn Checkpointer>, RunConfig) {
     let saver: Arc<dyn Checkpointer> = Arc::new(InMemorySaver::new());
     let config = RunConfig::new()
@@ -191,25 +198,29 @@ async fn second_invoke_merges_input_into_stored_channels() {
             .add_edge("bump", END);
     });
     let (saver, config) = saver_config("merge");
-    let first = graph
-        .invoke(
-            &bundle(1, "kept", &["a"], vec![message("m1", "hi")]),
-            &config,
-        )
-        .await
-        .expect("first");
+    let first = take_finished(
+        graph
+            .invoke(
+                &bundle(1, "kept", &["a"], vec![message("m1", "hi")]),
+                &config,
+            )
+            .await
+            .expect("first"),
+    );
     assert_eq!(first.n, 2);
     assert_eq!(first.tag, "kept");
     assert_eq!(first.notes, ["a".to_string()]);
     assert_eq!(message_ids(&first.messages), ["m1".to_string()]);
 
-    let second = graph
-        .invoke(
-            &bundle(9, "replaced", &["b"], vec![message("m2", "there")]),
-            &config,
-        )
-        .await
-        .expect("second");
+    let second = take_finished(
+        graph
+            .invoke(
+                &bundle(9, "replaced", &["b"], vec![message("m2", "there")]),
+                &config,
+            )
+            .await
+            .expect("second"),
+    );
     assert_eq!(second.n, 10);
     assert_eq!(second.tag, "replaced");
     assert_eq!(second.notes, ["a".to_string(), "b".to_string()]);
@@ -366,10 +377,12 @@ async fn checkpoint_id_forks_a_child_and_keeps_the_previous_tip() {
             .add_edge("b", END);
     });
     let (_saver, config) = saver_config("fork");
-    let finished = graph
-        .invoke(&bundle(1, "", &[], vec![]), &config)
-        .await
-        .expect("first run");
+    let finished = take_finished(
+        graph
+            .invoke(&bundle(1, "", &[], vec![]), &config)
+            .await
+            .expect("first run"),
+    );
     assert_eq!(finished.n, 2);
     assert_eq!(finished.tag, "b");
 
@@ -391,13 +404,15 @@ async fn checkpoint_id_forks_a_child_and_keeps_the_previous_tip() {
         .expect("input");
     let input_id = input.config.get_checkpoint_id().unwrap().to_string();
 
-    let forked = graph
-        .invoke(
-            &bundle(10, "x", &[], vec![]),
-            &config.clone().checkpoint_id(&input_id),
-        )
-        .await
-        .expect("fork");
+    let forked = take_finished(
+        graph
+            .invoke(
+                &bundle(10, "x", &[], vec![]),
+                &config.clone().checkpoint_id(&input_id),
+            )
+            .await
+            .expect("fork"),
+    );
     assert_eq!(forked.n, 11);
     assert_eq!(forked.tag, "b");
 
@@ -589,10 +604,12 @@ async fn resume_continues_scheduled_nodes_instead_of_restarting() {
     assert_eq!(paused.metadata.step, 0);
     assert!(paused.interrupts.is_empty());
 
-    let resumed = graph
-        .invoke(&bundle(4, "input", &["later"], vec![]), &config)
-        .await
-        .expect("resume");
+    let resumed = take_finished(
+        graph
+            .invoke(&bundle(4, "input", &["later"], vec![]), &config)
+            .await
+            .expect("resume"),
+    );
     assert_eq!(a_calls.load(Ordering::SeqCst), 1);
     assert_eq!(b_calls.load(Ordering::SeqCst), 1);
     assert_eq!(resumed.n, 4);
