@@ -37,7 +37,9 @@ pub enum Error {
     ///
     /// With a static path map, the router's label is mapped first. A label
     /// the map does not contain is this variant. Without a path map, the
-    /// router is expected to return node names directly.
+    /// router is expected to return node names directly. A [`crate::Send`]
+    /// names its node directly. The path map does not rewrite it. The
+    /// superstep that produced the route does not commit.
     #[error("unknown node: {0}")]
     UnknownNode(String),
 

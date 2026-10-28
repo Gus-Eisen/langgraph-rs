@@ -4,7 +4,8 @@
 //! `add_messages`, the graph builder, Pregel `invoke`, and the checkpointers.
 //! `compile` checks a graph. `CompiledGraph::invoke` runs it and returns
 //! [`RunOutput`]. `interrupt` pauses a node until [`Resume`] supplies a
-//! value. `InMemorySaver` keeps a thread in memory. `SqliteSaver::open`
+//! value. A conditional router may return [`Send`]. `InMemorySaver` keeps a
+//! thread in memory. `SqliteSaver::open`
 //! keeps the same checkpoints in a SQLite file. The prebuilt agent is a
 //! later milestone. See the repository `ROADMAP.md` and `ARCHITECTURE.md`.
 
@@ -12,15 +13,15 @@
 
 pub use langgraph_checkpoint::{
     checkpoint_timestamp, new_checkpoint_id, BoxFuture, Checkpoint, CheckpointConfig,
-    CheckpointMetadata, CheckpointSource, CheckpointTuple, Checkpointer, Error as CheckpointError,
-    InMemorySaver, PendingWrite, SqliteSaver,
+    CheckpointMetadata, CheckpointSend, CheckpointSource, CheckpointTuple, Checkpointer,
+    Error as CheckpointError, InMemorySaver, PendingWrite, SqliteSaver,
 };
 pub use langgraph_core::{
     add_messages, interrupt, interrupt_id, AsyncNodeMarker, ChannelMap, CompiledGraph,
     CustomReducer, EdgeSource, Error, Field, GraphBuilder, GraphState, Interrupt, InterruptNodes,
-    IntoEdgeSource, IntoRoute, PendingTask, Reducer, Resume, Route, RunConfig, RunOutput,
-    StateSnapshot, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES,
-    RESERVED_NAMES, START,
+    IntoEdgeSource, IntoRoute, PendingTask, Reducer, Resume, Route, RouteTarget, RunConfig,
+    RunOutput, Send, StateSnapshot, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END,
+    REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
 };
 
 /// Version of this facade crate.
@@ -93,6 +94,15 @@ mod tests {
             crate::RunOutput::Finished { state } => assert_eq!(state, ()),
             crate::RunOutput::Interrupted { .. } => panic!("expected Finished"),
         }
+    }
+
+    #[test]
+    fn facade_reexports_send() {
+        let send = crate::Send::new("map", serde_json::json!({"tag": "a"}));
+        assert_eq!(send.node, "map");
+        assert_eq!(send.value["tag"], "a");
+        let targets = crate::IntoRoute::into_targets(crate::RouteTarget::Send(send));
+        assert!(matches!(targets.as_slice(), [crate::RouteTarget::Send(_)]));
     }
 
     #[test]

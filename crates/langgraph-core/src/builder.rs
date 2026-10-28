@@ -32,9 +32,10 @@ type NodeFuture<'a, S> =
 
 /// How the runtime runs a node.
 ///
-/// Sync and async nodes both implement this. The input is `&S` until the Send
-/// milestone widens it. Call this trait instead of the stored closure so that
-/// widening does not rewrite call sites.
+/// Sync and async nodes both implement this. [`InvokeNode::call`] takes `&S`.
+/// A [`crate::Send`] task merges its JSON object onto a clone of the committed
+/// snapshot first, so the reference is that task's view. [`GraphBuilder::add_node`]
+/// still accepts `fn(&S)`.
 ///
 /// [`GraphBuilder::compile`] does not call [`InvokeNode::call`].
 pub(crate) trait InvokeNode<S>: Send + Sync
@@ -59,14 +60,14 @@ where
 /// How the runtime runs a conditional router.
 ///
 /// The router sees `reduce(snapshot_at_step_start, this_node_update)` and
-/// returns destination names. [`END`] is the finish sentinel. Compile does
-/// not call [`InvokeRouter::route`].
+/// returns node names, [`END`], or [`crate::Send`] packets. Compile does not call
+/// [`InvokeRouter::route`].
 pub(crate) trait InvokeRouter<S>: Send + Sync
 where
     S: GraphState,
 {
-    /// Choose the next nodes from the source task's reduced state.
-    fn route(&self, state: &S) -> Result<Vec<String>, Error>;
+    /// Choose the next tasks from the source task's reduced state.
+    fn route(&self, state: &S) -> Result<Vec<RouteTarget>, Error>;
 }
 
 trait AsyncCall<'a, S, F>
@@ -180,8 +181,8 @@ where
     F: Fn(&S) -> Result<T, Error> + Send + Sync,
     T: IntoRoute,
 {
-    fn route(&self, state: &S) -> Result<Vec<String>, Error> {
-        (self.0)(state).map(IntoRoute::into_destinations)
+    fn route(&self, state: &S) -> Result<Vec<RouteTarget>, Error> {
+        (self.0)(state).map(IntoRoute::into_targets)
     }
 }
 
@@ -275,10 +276,57 @@ impl<const N: usize> IntoEdgeSource for [&str; N] {
     }
 }
 
+/// Fan-out packet returned by a conditional router.
+///
+/// The type lives in this module so its name does not hide the [`std::marker::Send`]
+/// bound used by the builder. The crate root re-exports it as [`crate::Send`].
+pub(crate) mod packet {
+    use serde_json::Value;
+
+    /// One task scheduled for the next superstep with its own input.
+    ///
+    /// A conditional router returns this value by itself, in a list, or inside
+    /// [`super::RouteTarget`] next to node names and [`super::END`]. `node` is
+    /// the target. `value` is a JSON object. The runtime clones the committed
+    /// snapshot, replaces the named fields with that object, and passes the
+    /// result to the node as `&S`. Each packet is its own concurrent task. Two
+    /// packets for the same node are not collapsed. A repeated plain node name
+    /// still is.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Send {
+        /// Node that runs on the next superstep.
+        pub node: String,
+        /// JSON object merged onto a clone of the committed snapshot.
+        pub value: Value,
+    }
+
+    impl Send {
+        /// Packet for `node` with `value` as the task's partial input.
+        pub fn new(node: impl Into<String>, value: impl Into<Value>) -> Self {
+            Self {
+                node: node.into(),
+                value: value.into(),
+            }
+        }
+    }
+}
+
+/// One destination a conditional router returns.
+///
+/// [`RouteTarget::Node`] is a node name or [`END`]. [`RouteTarget::Send`] is
+/// a [`crate::Send`] packet. A `Vec` of this enum mixes the two in one return value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteTarget {
+    /// A node name, or [`END`].
+    Node(String),
+    /// A task with its own input on the next superstep.
+    Send(packet::Send),
+}
+
 /// Destinations a conditional router returns.
 ///
 /// One name, several names, or [`END`]. A name equal to [`END`] finishes the
-/// branch. `Send` is a later milestone and is not represented here.
+/// branch. Return [`crate::Send`] when the next task needs its own input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     destinations: Vec<String>,
@@ -318,66 +366,126 @@ impl Route {
 
 /// Return types accepted by [`GraphBuilder::add_conditional_edges`].
 ///
-/// A string is one destination. An array, slice, or `Vec` is several. This
-/// trait is sealed.
+/// A string is one destination. An array, slice, or `Vec` of strings is
+/// several. [`crate::Send`] and a list of them schedule per-task inputs.
+/// [`RouteTarget`] mixes names and sends. This trait is sealed.
 pub trait IntoRoute: sealed::RouteSealed {
-    /// Destination names. [`END`] is the finish sentinel.
-    fn into_destinations(self) -> Vec<String>;
+    /// Node names, [`END`], and [`crate::Send`] packets, in router order.
+    fn into_targets(self) -> Vec<RouteTarget>;
 }
 
 impl sealed::RouteSealed for Route {}
 impl IntoRoute for Route {
-    fn into_destinations(self) -> Vec<String> {
+    fn into_targets(self) -> Vec<RouteTarget> {
         self.destinations
+            .into_iter()
+            .map(RouteTarget::Node)
+            .collect()
     }
 }
 
 impl sealed::RouteSealed for &Route {}
 impl IntoRoute for &Route {
-    fn into_destinations(self) -> Vec<String> {
-        self.destinations.clone()
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.destinations
+            .iter()
+            .cloned()
+            .map(RouteTarget::Node)
+            .collect()
     }
 }
 
 impl sealed::RouteSealed for &str {}
 impl IntoRoute for &str {
-    fn into_destinations(self) -> Vec<String> {
-        vec![self.to_string()]
+    fn into_targets(self) -> Vec<RouteTarget> {
+        vec![RouteTarget::Node(self.to_string())]
     }
 }
 
 impl sealed::RouteSealed for String {}
 impl IntoRoute for String {
-    fn into_destinations(self) -> Vec<String> {
-        vec![self]
+    fn into_targets(self) -> Vec<RouteTarget> {
+        vec![RouteTarget::Node(self)]
     }
 }
 
 impl sealed::RouteSealed for Vec<String> {}
 impl IntoRoute for Vec<String> {
-    fn into_destinations(self) -> Vec<String> {
-        self
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter().map(RouteTarget::Node).collect()
     }
 }
 
 impl sealed::RouteSealed for Vec<&str> {}
 impl IntoRoute for Vec<&str> {
-    fn into_destinations(self) -> Vec<String> {
-        self.into_iter().map(str::to_string).collect()
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter()
+            .map(str::to_string)
+            .map(RouteTarget::Node)
+            .collect()
     }
 }
 
 impl<'a> sealed::RouteSealed for &'a [&'a str] {}
 impl<'a> IntoRoute for &'a [&'a str] {
-    fn into_destinations(self) -> Vec<String> {
-        self.iter().copied().map(str::to_string).collect()
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.iter()
+            .copied()
+            .map(str::to_string)
+            .map(RouteTarget::Node)
+            .collect()
     }
 }
 
 impl<const N: usize> sealed::RouteSealed for [&str; N] {}
 impl<const N: usize> IntoRoute for [&str; N] {
-    fn into_destinations(self) -> Vec<String> {
-        self.into_iter().map(str::to_string).collect()
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter()
+            .map(str::to_string)
+            .map(RouteTarget::Node)
+            .collect()
+    }
+}
+
+impl sealed::RouteSealed for packet::Send {}
+impl IntoRoute for packet::Send {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        vec![RouteTarget::Send(self)]
+    }
+}
+
+impl sealed::RouteSealed for Vec<packet::Send> {}
+impl IntoRoute for Vec<packet::Send> {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter().map(RouteTarget::Send).collect()
+    }
+}
+
+impl<const N: usize> sealed::RouteSealed for [packet::Send; N] {}
+impl<const N: usize> IntoRoute for [packet::Send; N] {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter().map(RouteTarget::Send).collect()
+    }
+}
+
+impl sealed::RouteSealed for RouteTarget {}
+impl IntoRoute for RouteTarget {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        vec![self]
+    }
+}
+
+impl sealed::RouteSealed for Vec<RouteTarget> {}
+impl IntoRoute for Vec<RouteTarget> {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self
+    }
+}
+
+impl<const N: usize> sealed::RouteSealed for [RouteTarget; N] {}
+impl<const N: usize> IntoRoute for [RouteTarget; N] {
+    fn into_targets(self) -> Vec<RouteTarget> {
+        self.into_iter().collect()
     }
 }
 
@@ -585,7 +693,9 @@ impl<S: GraphState> GraphBuilder<S> {
     ///
     /// The router is stored and not called. It will later see the source
     /// node's own reduced state and return one node name, several node names,
-    /// or [`END`]. Without a path map, an unknown name fails at runtime.
+    /// [`END`], or one or more [`crate::Send`] packets. Without a path map, an
+    /// unknown name fails at runtime. A path map rewrites plain names only.
+    /// A [`crate::Send`] names its node directly.
     /// [`Self::add_conditional_edges_with_path_map`] checks static targets at
     /// compile.
     pub fn add_conditional_edges<R, T>(&mut self, from: impl Into<String>, router: R) -> &mut Self

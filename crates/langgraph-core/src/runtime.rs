@@ -5,8 +5,10 @@
 //! is reached. Control channels are separate from user channels:
 //! `done:{node}` counts completions of that node or of `START`, and
 //! `branch:{edge}:{dest}` counts conditional selections of `dest`.
-//! `versions_seen` maps a node to the control-channel versions it has
-//! already consumed. A checkpointer persists that map with the channel
+//! Duplicate plain names on one edge share that branch entry. A [`crate::Send`]
+//! is not a branch entry: each packet is stored on the checkpoint and becomes
+//! its own task. `versions_seen` maps a node to the control-channel versions
+//! it has already consumed. A checkpointer persists that map with the channel
 //! values so a later invoke can resume. [`crate::interrupt`] pauses a task.
 //! Finished siblings keep their writes in `put_writes` until the superstep
 //! commits.
@@ -15,13 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use langgraph_checkpoint::{
-    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointSource, CheckpointTuple,
-    Checkpointer, PendingWrite,
+    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointSend, CheckpointSource,
+    CheckpointTuple, Checkpointer, PendingWrite,
 };
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
-use crate::builder::{ConditionalEdge, Edge, EdgeSource, InterruptSet, InvokeNode};
+use crate::builder::{ConditionalEdge, Edge, EdgeSource, InterruptSet, InvokeNode, RouteTarget};
 use crate::interrupt::{
     dynamic_interrupts, has_dynamic_interrupt, is_breakpoint_marker, is_pause, scope_task,
     stored_resume, task_done, task_interrupted, with_thread_frame, FrameHandle, Interrupt,
@@ -224,17 +226,22 @@ where
     /// completion newer than the one the target last consumed. Those sources
     /// need not have finished in the same superstep.
     ///
-    /// A superstep runs every scheduled node at once. Each node reads the
-    /// committed snapshot from the start of the step. Sync nodes are called
-    /// on `spawn_blocking`. Async nodes are awaited on this runtime. After a
-    /// node returns, each of its conditional routers runs inside that task.
-    /// A router sees `reduce(snapshot, this_node_update)` and does not see
-    /// other tasks from this step. A static path map is applied to the
-    /// router's labels before names are checked. An unknown name is
-    /// [`Error::UnknownNode`].
+    /// A superstep runs every scheduled task at once. A plain trigger reads
+    /// the committed snapshot from the start of the step. A [`crate::Send`]
+    /// reads that snapshot with the packet's JSON object merged on top, and
+    /// each packet is its own task, including two sends to the same node.
+    /// Sync nodes are called on `spawn_blocking`. Async nodes are awaited on
+    /// this runtime. After a node returns, each of its conditional routers
+    /// runs inside that task. A router sees `reduce(snapshot, this_node_update)`
+    /// and does not see other tasks from this step. A static path map is
+    /// applied to plain labels before names are checked. A [`crate::Send`]
+    /// names its node directly. An unknown name is [`Error::UnknownNode`] and
+    /// that step does not commit.
     ///
     /// The barrier folds the step's writes in `(task_path, task_id, write_index)`
-    /// order. `task_path` is empty at the root. `task_id` is the node name.
+    /// order. `task_path` is empty at the root. `task_id` is the node name for
+    /// a plain trigger. Each [`crate::Send`] gets its own `task_id`, ordered
+    /// by send index, so two sends to one node do not fold in completion order.
     /// A task [`Err`](Result::Err) fails the superstep: the other tasks
     /// are joined, and the step commits nothing. Two overwrite writes in one
     /// step are [`Error::InvalidUpdate`] and also commit nothing.
@@ -261,7 +268,8 @@ where
     /// breakpoint pause does not count as a superstep.
     ///
     /// Polling this future outside tokio returns [`Error::NoRuntime`]. There
-    /// is no `stream` method, `Send`, or `Command` on this call.
+    /// is no `stream` method and no `Command` on this call. A conditional
+    /// router may return [`crate::Send`].
     ///
     /// With a checkpointer, the call loads `config`'s checkpoint first
     /// (`checkpoint_id` when set, otherwise the latest in the thread and
@@ -623,7 +631,7 @@ where
         let nodes = node_map(&self.nodes);
         let next = schedule(&self.edges, &nodes, &control)
             .into_iter()
-            .filter(|task| !task_done(&tuple.pending_writes, &task.name))
+            .filter(|task| !task_done(&tuple.pending_writes, &task.task_id))
             .map(|task| task.name)
             .collect::<Vec<_>>();
         let tasks = next
@@ -652,12 +660,15 @@ pub struct StateSnapshot<S> {
     /// State reconstructed from the checkpoint's channel values.
     pub values: S,
     /// Node names the next superstep would run, in name order.
+    ///
+    /// One plain trigger contributes one name. Each stored fan-out packet
+    /// contributes another, so one node may appear more than once.
     pub next: Vec<String>,
     /// Config that loads this checkpoint, including the same saver.
     pub config: RunConfig,
     /// Config of the parent checkpoint in this namespace.
     pub parent_config: Option<RunConfig>,
-    /// One task per name in [`StateSnapshot::next`].
+    /// One entry per task in [`StateSnapshot::next`], in the same order.
     pub tasks: Vec<PendingTask>,
     /// Unanswered [`crate::interrupt`] calls stored on this checkpoint.
     ///
@@ -671,7 +682,8 @@ pub struct StateSnapshot<S> {
 /// A node that would run on the next superstep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTask {
-    /// Node name. One task per node until `Send` exists.
+    /// Node name. Two fan-out packets to one node are two tasks with the
+    /// same name.
     pub name: String,
 }
 
@@ -679,6 +691,7 @@ struct Control {
     done: BTreeMap<String, u64>,
     branch: BTreeMap<String, u64>,
     seen: BTreeMap<String, BTreeMap<String, u64>>,
+    sends: Vec<CheckpointSend>,
 }
 
 impl Control {
@@ -687,6 +700,7 @@ impl Control {
             done: BTreeMap::new(),
             branch: BTreeMap::new(),
             seen: BTreeMap::new(),
+            sends: Vec::new(),
         }
     }
 
@@ -712,6 +726,14 @@ impl Control {
             if route.destination == END {
                 continue;
             }
+            if let Some(value) = &route.send {
+                self.sends.push(CheckpointSend {
+                    edge_index: route.edge_index,
+                    node: route.destination.clone(),
+                    value: value.clone(),
+                });
+                continue;
+            }
             if !bumped.insert((route.edge_index, route.destination.clone())) {
                 continue;
             }
@@ -735,15 +757,21 @@ impl Control {
 struct RoutePush {
     edge_index: usize,
     destination: String,
+    /// Set for a [`crate::Send`]. Plain names are `None` and are deduped.
+    send: Option<Value>,
 }
 
 struct Scheduled {
     name: String,
+    task_id: String,
     consumed: Vec<(String, u64)>,
+    /// Index into [`Control::sends`] when this task is a fan-out packet.
+    send_index: Option<usize>,
+    send_value: Option<Value>,
 }
 
 struct TaskOutput {
-    name: String,
+    task_id: String,
     writes: Vec<Write>,
     routed: Vec<RoutePush>,
     pause: Option<TaskPause>,
@@ -820,11 +848,32 @@ where
         if let Some(consumed) = ready_triggers(edges, name, control) {
             scheduled.push(Scheduled {
                 name: name.clone(),
+                task_id: name.clone(),
                 consumed,
+                send_index: None,
+                send_value: None,
             });
         }
     }
+    for (index, packet) in control.sends.iter().enumerate() {
+        scheduled.push(Scheduled {
+            name: packet.node.clone(),
+            task_id: send_task_id(&packet.node, index),
+            consumed: Vec::new(),
+            send_index: Some(index),
+            send_value: Some(packet.value.clone()),
+        });
+    }
+    scheduled.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
     scheduled
+}
+
+fn send_task_id(node: &str, index: usize) -> String {
+    format!("{node}:{index:08}")
 }
 
 fn ready_triggers(edges: &[Edge], node: &str, control: &Control) -> Option<Vec<(String, u64)>> {
@@ -888,23 +937,54 @@ fn route_from<S: GraphState>(
         if edge.from != from {
             continue;
         }
-        let labels = edge.router.route(state)?;
-        for label in labels {
-            let destination = match &edge.path_map {
-                Some(path_map) => path_map
-                    .get(&label)
-                    .cloned()
-                    .ok_or_else(|| Error::UnknownNode(format!("path map label '{label}'")))?,
-                None => label,
-            };
-            if destination != END && !known.contains(&destination) {
-                return Err(Error::UnknownNode(destination));
-            }
-            if destination != END {
-                routed.push(RoutePush {
-                    edge_index,
-                    destination,
-                });
+        let targets = edge.router.route(state)?;
+        for target in targets {
+            match target {
+                RouteTarget::Node(label) => {
+                    let destination = match &edge.path_map {
+                        Some(path_map) => path_map.get(&label).cloned().ok_or_else(|| {
+                            Error::UnknownNode(format!("path map label '{label}'"))
+                        })?,
+                        None => label,
+                    };
+                    if destination != END && !known.contains(&destination) {
+                        return Err(Error::UnknownNode(destination));
+                    }
+                    if destination != END {
+                        routed.push(RoutePush {
+                            edge_index,
+                            destination,
+                            send: None,
+                        });
+                    }
+                }
+                RouteTarget::Send(packet) => {
+                    if packet.node == END {
+                        continue;
+                    }
+                    if !known.contains(&packet.node) {
+                        return Err(Error::UnknownNode(packet.node));
+                    }
+                    if !packet.value.is_object() {
+                        return Err(Error::InvalidUpdate(
+                            "Send value must be a JSON object".into(),
+                        ));
+                    }
+                    if let Some(object) = packet.value.as_object() {
+                        for key in object.keys() {
+                            if !S::schema().iter().any(|field| field.name == key) {
+                                return Err(Error::InvalidUpdate(format!(
+                                    "Send value writes unknown channel '{key}'"
+                                )));
+                            }
+                        }
+                    }
+                    routed.push(RoutePush {
+                        edge_index,
+                        destination: packet.node,
+                        send: Some(packet.value),
+                    });
+                }
             }
         }
     }
@@ -922,10 +1002,11 @@ fn preview_state<S: GraphState>(base: &ChannelMap, writes: &[Write]) -> Result<S
 
 fn after_update<S: GraphState>(
     name: String,
+    task_id: String,
     update: S::Update,
     shared: &StepShared<S>,
 ) -> Result<TaskOutput, Error> {
-    let writes = S::update_to_writes(&update, &[], &name)?;
+    let writes = S::update_to_writes(&update, &[], &task_id)?;
     let routed = if shared.conditionals.iter().any(|edge| edge.from == name) {
         let preview = preview_state::<S>(&shared.base, &writes)?;
         route_from(
@@ -938,11 +1019,27 @@ fn after_update<S: GraphState>(
         Vec::new()
     };
     Ok(TaskOutput {
-        name,
+        task_id,
         writes,
         routed,
         pause: None,
     })
+}
+
+fn merge_send_view<S: GraphState>(base: &ChannelMap, value: &Value) -> Result<S, Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::InvalidUpdate("Send value must be a JSON object".into()))?;
+    let mut values = base.values();
+    for (key, field_value) in object {
+        if !S::schema().iter().any(|field| field.name == key) {
+            return Err(Error::InvalidUpdate(format!(
+                "Send value writes unknown channel '{key}'"
+            )));
+        }
+        values.insert(key.clone(), field_value.clone());
+    }
+    S::from_channel_values(&values)
 }
 
 fn node_failure(name: &str, error: Error) -> Error {
@@ -987,6 +1084,7 @@ fn spawn_task<S>(
     snapshot: Arc<S>,
     shared: Arc<StepShared<S>>,
     name: String,
+    task_id: String,
     frame: FrameHandle,
 ) -> JoinHandle<Result<TaskOutput, Error>>
 where
@@ -997,26 +1095,27 @@ where
         tokio::task::spawn_blocking(move || {
             with_thread_frame(Arc::clone(&frame), || {
                 let update = drive_sync(node.as_ref(), snapshot.as_ref());
-                finish_task(name, update, frame.as_ref(), shared.as_ref())
+                finish_task(name, task_id, update, frame.as_ref(), shared.as_ref())
             })
         })
     } else {
         tokio::spawn(scope_task(Arc::clone(&frame), async move {
             let update = node.call(snapshot.as_ref()).await;
-            finish_task(name, update, frame.as_ref(), shared.as_ref())
+            finish_task(name, task_id, update, frame.as_ref(), shared.as_ref())
         }))
     }
 }
 
 fn finish_task<S: GraphState>(
     name: String,
+    task_id: String,
     update: Result<S::Update, Error>,
     frame: &InterruptFrame,
     shared: &StepShared<S>,
 ) -> Result<TaskOutput, Error> {
     if let Some(interrupt) = frame.take_raised() {
         return Ok(TaskOutput {
-            name,
+            task_id,
             writes: Vec::new(),
             routed: Vec::new(),
             pause: Some(TaskPause {
@@ -1026,7 +1125,7 @@ fn finish_task<S: GraphState>(
         });
     }
     match update {
-        Ok(update) => after_update(name, update, shared),
+        Ok(update) => after_update(name, task_id, update, shared),
         Err(Error::MissingThreadId) => Err(Error::MissingThreadId),
         Err(error) => Err(node_failure(&name, error)),
     }
@@ -1057,28 +1156,41 @@ where
         pending,
         config,
     } = input;
+    for task in &scheduled {
+        if !nodes.contains_key(&task.name) {
+            return Err(Error::UnknownNode(task.name.clone()));
+        }
+    }
     let snapshot = Arc::new(channels.to_state::<S>()?);
+    let mut views = Vec::with_capacity(scheduled.len());
+    for task in &scheduled {
+        if task_done(pending, &task.task_id) {
+            views.push(None);
+            continue;
+        }
+        let view = match &task.send_value {
+            Some(value) => Arc::new(merge_send_view::<S>(channels, value)?),
+            None => Arc::clone(&snapshot),
+        };
+        views.push(Some(view));
+    }
     let shared = Arc::new(StepShared {
         base: channels.clone(),
         conditionals: Arc::clone(conditionals),
         known: Arc::clone(known),
     });
     let (null_value, resume_map) = resume_parts(config.get_resume());
-    let run_names = scheduled
-        .iter()
-        .filter(|task| !task_done(pending, &task.name))
-        .map(|task| task.name.as_str())
-        .collect::<Vec<_>>();
-    let null_owner = null_resume_task(&run_names, pending, null_value.is_some());
+    let null_owner =
+        null_resume_task(&scheduled, pending, null_value.is_some()).map(str::to_string);
 
     let mut results = Vec::new();
     let mut handles = Vec::new();
     let mut handle_names = Vec::new();
-    for task in &scheduled {
-        if task_done(pending, &task.name) {
-            let (writes, routed) = decode_replay(pending, &task.name)?;
+    for (task, view) in scheduled.iter().zip(views) {
+        if task_done(pending, &task.task_id) {
+            let (writes, routed) = decode_replay(pending, &task.task_id)?;
             results.push(TaskOutput {
-                name: task.name.clone(),
+                task_id: task.task_id.clone(),
                 writes,
                 routed,
                 pause: None,
@@ -1086,13 +1198,13 @@ where
             continue;
         }
         let node = Arc::clone(nodes.get(&task.name).expect("scheduled node is registered"));
-        let answers = stored_resume(pending, &task.name)?;
+        let answers = stored_resume(pending, &task.task_id)?;
         let frame = InterruptFrame::new(TaskResume {
             checkpoint_ns: config.get_checkpoint_ns().to_string(),
             task_path: vec![task.name.clone()],
             has_checkpointer: config.get_checkpointer().is_some(),
             answers,
-            null_resume: if Some(task.name.as_str()) == null_owner {
+            null_resume: if Some(task.task_id.as_str()) == null_owner.as_deref() {
                 null_value.clone()
             } else {
                 None
@@ -1102,9 +1214,10 @@ where
         handle_names.push(task.name.clone());
         handles.push(spawn_task(
             node,
-            Arc::clone(&snapshot),
+            view.expect("running task has an input view"),
             Arc::clone(&shared),
             task.name.clone(),
+            task.task_id.clone(),
             frame,
         ));
     }
@@ -1144,13 +1257,13 @@ where
             if let Some(pause) = &result.pause {
                 interrupts.push(pause.interrupt.clone());
                 groups.insert(
-                    result.name.clone(),
-                    encode_interrupted(&result.name, &pause.interrupt, &pause.resume_values),
+                    result.task_id.clone(),
+                    encode_interrupted(&result.task_id, &pause.interrupt, &pause.resume_values),
                 );
             } else {
                 groups.insert(
-                    result.name.clone(),
-                    encode_finished(&result.name, &result.writes, &result.routed),
+                    result.task_id.clone(),
+                    encode_finished(&result.task_id, &result.writes, &result.routed),
                 );
             }
         }
@@ -1161,7 +1274,7 @@ where
         });
     }
 
-    results.sort_by(|left, right| left.name.cmp(&right.name));
+    results.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     let mut writes = Vec::new();
     for result in &mut results {
         writes.append(&mut result.writes);
@@ -1169,9 +1282,12 @@ where
     channels.apply_writes(&writes)?;
 
     for task in &scheduled {
-        control.mark_consumed(&task.name, &task.consumed);
+        if !task.consumed.is_empty() {
+            control.mark_consumed(&task.name, &task.consumed);
+        }
         control.bump_done(&task.name);
     }
+    drop_executed_sends(control, &scheduled);
     for result in &results {
         control.apply_routes(&result.routed);
     }
@@ -1190,23 +1306,47 @@ fn resume_parts(resume: Option<&Resume>) -> (Option<Value>, BTreeMap<String, Val
 }
 
 fn null_resume_task<'a>(
-    to_run: &[&'a str],
+    tasks: &'a [Scheduled],
     pending: &[PendingWrite],
     has_value: bool,
 ) -> Option<&'a str> {
     if !has_value {
         return None;
     }
-    let mut interrupted = to_run
+    let running: Vec<&Scheduled> = tasks
+        .iter()
+        .filter(|task| !task_done(pending, &task.task_id))
+        .collect();
+    let mut chosen: Vec<&Scheduled> = running
         .iter()
         .copied()
-        .filter(|name| task_interrupted(pending, name))
-        .collect::<Vec<_>>();
-    if interrupted.is_empty() {
-        interrupted = to_run.to_vec();
+        .filter(|task| task_interrupted(pending, &task.task_id))
+        .collect();
+    if chosen.is_empty() {
+        chosen = running;
     }
-    interrupted.sort_unstable();
-    interrupted.first().copied()
+    chosen.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    chosen.first().map(|task| task.task_id.as_str())
+}
+
+fn drop_executed_sends(control: &mut Control, scheduled: &[Scheduled]) {
+    let executed = scheduled
+        .iter()
+        .filter_map(|task| task.send_index)
+        .collect::<BTreeSet<_>>();
+    if executed.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    control.sends.retain(|_| {
+        let drop_this = executed.contains(&index);
+        index += 1;
+        !drop_this
+    });
 }
 
 fn interrupts_match(
@@ -1274,10 +1414,16 @@ fn encode_finished(task_id: &str, writes: &[Write], routes: &[RoutePush]) -> Vec
             "status": "done",
             "routes": routes
                 .iter()
-                .map(|route| json!({
-                    "edge_index": route.edge_index,
-                    "destination": route.destination,
-                }))
+                .map(|route| {
+                    let mut encoded = json!({
+                        "edge_index": route.edge_index,
+                        "destination": route.destination,
+                    });
+                    if let Some(value) = &route.send {
+                        encoded["send"] = value.clone();
+                    }
+                    encoded
+                })
                 .collect::<Vec<_>>(),
         }),
     });
@@ -1362,9 +1508,14 @@ fn parse_routes(value: &Value) -> Result<Vec<RoutePush>, Error> {
             .ok_or_else(|| Error::Checkpoint("pending route is missing destination".into()))?;
         let edge_index = usize::try_from(edge_index)
             .map_err(|_| Error::Checkpoint("pending route edge_index does not fit".into()))?;
+        let send = match route.get("send") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.clone()),
+        };
         parsed.push(RoutePush {
             edge_index,
             destination: destination.to_string(),
+            send,
         });
     }
     Ok(parsed)
@@ -1395,6 +1546,7 @@ fn restore_run<S: GraphState>(checkpoint: &Checkpoint) -> Result<(ChannelMap, Co
         done: checkpoint.done.clone(),
         branch: checkpoint.branch.clone(),
         seen: checkpoint.versions_seen.clone(),
+        sends: checkpoint.sends.clone(),
     };
     Ok((channels, control))
 }
@@ -1445,6 +1597,7 @@ async fn save_checkpoint(
         updated_channels: step.updated.to_vec(),
         done: step.control.done.clone(),
         branch: step.control.branch.clone(),
+        sends: step.control.sends.clone(),
     };
     let metadata = CheckpointMetadata {
         source: step.source,
