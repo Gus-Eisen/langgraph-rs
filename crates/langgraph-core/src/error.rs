@@ -4,7 +4,8 @@
 //! [`crate::GraphBuilder::compile`] return [`Error::GraphValidation`].
 //! [`crate::CompiledGraph::invoke`] adds [`Error::UnknownNode`],
 //! [`Error::RecursionLimit`], [`Error::NoRuntime`], and [`Error::Node`].
-//! Later milestones add further variants to this enum.
+//! A configured checkpointer adds [`Error::MissingThreadId`] and
+//! [`Error::Checkpoint`].
 
 use thiserror::Error;
 
@@ -58,4 +59,15 @@ pub enum Error {
     /// writes are committed.
     #[error("node '{node}' failed: {message}")]
     Node { node: String, message: String },
+
+    /// A checkpointer is configured and the run has no thread id.
+    ///
+    /// Checked before any node runs and before any checkpoint read. With no
+    /// checkpointer, `thread_id` is ignored.
+    #[error("missing thread id")]
+    MissingThreadId,
+
+    /// The checkpointer failed, or the requested checkpoint does not exist.
+    #[error("checkpoint: {0}")]
+    Checkpoint(String),
 }

@@ -430,8 +430,8 @@ impl<S: GraphState> fmt::Debug for ConditionalEdge<S> {
 /// Recorded graph structure for `S`.
 ///
 /// [`GraphBuilder::compile`] produces this. [`CompiledGraph::invoke`] runs it
-/// on the current tokio runtime. There is no checkpointer and no interrupt
-/// breakpoints.
+/// on the current tokio runtime. A checkpointer is set on the run config,
+/// not on the graph. There are no interrupt breakpoints.
 pub struct CompiledGraph<S: GraphState> {
     /// Nodes in registration order. `Arc` so a superstep can move each node
     /// onto `spawn_blocking` or a runtime task without borrowing the graph.

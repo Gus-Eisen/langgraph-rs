@@ -220,6 +220,48 @@ impl ChannelMap {
             .collect()
     }
 
+    /// Install checkpoint values and versions without folding reducers.
+    ///
+    /// Versions are stored as given. A channel omitted from `versions` is
+    /// version 0. A version of 0 has no value. A version above 0 requires a
+    /// value. Names that are not in the schema are
+    /// [`Error::GraphValidation`](Error::GraphValidation).
+    pub(crate) fn restore(
+        &mut self,
+        values: &BTreeMap<String, Value>,
+        versions: &BTreeMap<String, u64>,
+    ) -> Result<(), Error> {
+        for key in values.keys().chain(versions.keys()) {
+            if !self.channels.contains_key(key) {
+                return Err(Error::GraphValidation(format!(
+                    "checkpoint channel '{key}' is not in the schema"
+                )));
+            }
+        }
+        for (name, channel) in &self.channels {
+            let version = versions.get(name).copied().unwrap_or(0);
+            let value = values.get(name);
+            if version == 0 && value.is_some() {
+                return Err(Error::InvalidUpdate(format!(
+                    "checkpoint channel '{name}' has a value at version 0"
+                )));
+            }
+            if version > 0 && value.is_none() {
+                return Err(Error::InvalidUpdate(format!(
+                    "checkpoint channel '{name}' is missing its value"
+                )));
+            }
+            if let Some(value) = value {
+                value_matches_reducer(name, channel.reducer, value)?;
+            }
+        }
+        for (name, channel) in &mut self.channels {
+            channel.version = versions.get(name).copied().unwrap_or(0);
+            channel.value = values.get(name).cloned();
+        }
+        Ok(())
+    }
+
     /// Fold `writes` into the committed channels.
     ///
     /// Writes are grouped by channel and sorted by
@@ -279,22 +321,7 @@ impl ChannelMap {
         }
         for (name, value) in values {
             let reducer = self.channels[name].reducer;
-            match reducer {
-                Reducer::Append if !value.is_array() => {
-                    return Err(Error::InvalidUpdate(format!(
-                        "channel '{name}' append reducer expected a JSON array"
-                    )));
-                }
-                Reducer::AddMessages if !value.is_array() => {
-                    return Err(Error::InvalidUpdate(format!(
-                        "channel '{name}' add_messages reducer expected a JSON array"
-                    )));
-                }
-                Reducer::Overwrite
-                | Reducer::Custom(_)
-                | Reducer::Append
-                | Reducer::AddMessages => {}
-            }
+            value_matches_reducer(name, reducer, value)?;
         }
         for (name, value) in values {
             self.channels.get_mut(name).expect("channel exists").value = Some(value.clone());
@@ -349,6 +376,18 @@ fn write_order(left: &Write, right: &Write) -> std::cmp::Ordering {
         right.task_id.as_str(),
         right.write_index,
     ))
+}
+
+fn value_matches_reducer(name: &str, reducer: Reducer, value: &Value) -> Result<(), Error> {
+    match reducer {
+        Reducer::Append if !value.is_array() => Err(Error::InvalidUpdate(format!(
+            "channel '{name}' append reducer expected a JSON array"
+        ))),
+        Reducer::AddMessages if !value.is_array() => Err(Error::InvalidUpdate(format!(
+            "channel '{name}' add_messages reducer expected a JSON array"
+        ))),
+        Reducer::Overwrite | Reducer::Custom(_) | Reducer::Append | Reducer::AddMessages => Ok(()),
+    }
 }
 
 fn fold_writes(

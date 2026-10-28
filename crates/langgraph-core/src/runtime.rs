@@ -6,12 +6,16 @@
 //! `done:{node}` counts completions of that node or of `START`, and
 //! `branch:{edge}:{dest}` counts conditional selections of `dest`.
 //! `versions_seen` maps a node to the control-channel versions it has
-//! already consumed. A later checkpointer can persist that map as
-//! node to channel to version. This milestone keeps it only for the call.
+//! already consumed. A checkpointer persists that map with the channel
+//! values so a later invoke can resume.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use langgraph_checkpoint::{
+    Checkpoint, CheckpointConfig, CheckpointMetadata, CheckpointSource, CheckpointTuple,
+    Checkpointer,
+};
 use tokio::task::JoinHandle;
 
 use crate::builder::{ConditionalEdge, Edge, EdgeSource, InvokeNode};
@@ -26,24 +30,33 @@ pub const DEFAULT_RECURSION_LIMIT: u32 = 25;
 
 /// Options for [`CompiledGraph::invoke`].
 ///
-/// Build a value with [`RunConfig::new`] or [`Default`], then
-/// [`RunConfig::recursion_limit`] when the default budget is wrong. `invoke`
-/// rejects a limit below 1.
+/// [`RunConfig::new`] and [`Default`] set the recursion limit to
+/// [`DEFAULT_RECURSION_LIMIT`] and leave the checkpointer unset. `invoke`
+/// rejects a limit below 1. Add a saver with [`RunConfig::checkpointer`] and
+/// a thread with [`RunConfig::thread_id`]. Those fields are optional, so
+/// [`CompiledGraph::invoke`] keeps the same parameters.
 ///
-/// A later checkpointer milestone should add thread and checkpoint identity
-/// here, defaulted in [`RunConfig::new`], and should keep
-/// [`CompiledGraph::invoke`]'s parameters. New fields with defaults do not
-/// break callers that already build a [`RunConfig`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// With no checkpointer, `thread_id` and `checkpoint_id` are ignored and
+/// state lives only for that call. A checkpointer without a thread id is
+/// [`Error::MissingThreadId`] before any node runs.
+#[derive(Clone)]
 pub struct RunConfig {
     recursion_limit: u32,
+    thread_id: Option<String>,
+    checkpoint_ns: String,
+    checkpoint_id: Option<String>,
+    checkpointer: Option<Arc<dyn Checkpointer>>,
 }
 
 impl RunConfig {
-    /// Config with [`DEFAULT_RECURSION_LIMIT`].
+    /// Config with [`DEFAULT_RECURSION_LIMIT`] and no checkpointer.
     pub const fn new() -> Self {
         Self {
             recursion_limit: DEFAULT_RECURSION_LIMIT,
+            thread_id: None,
+            checkpoint_ns: String::new(),
+            checkpoint_id: None,
+            checkpointer: None,
         }
     }
 
@@ -52,7 +65,110 @@ impl RunConfig {
         self.recursion_limit = limit;
         self
     }
+
+    /// Thread to load and store. Ignored when no checkpointer is set.
+    ///
+    /// An empty string is treated as a missing id.
+    pub fn thread_id(mut self, thread_id: impl Into<String>) -> Self {
+        self.thread_id = Some(thread_id.into());
+        self
+    }
+
+    /// Checkpoint namespace. The root graph uses an empty string.
+    pub fn checkpoint_ns(mut self, checkpoint_ns: impl Into<String>) -> Self {
+        self.checkpoint_ns = checkpoint_ns.into();
+        self
+    }
+
+    /// Snapshot to load. The next write forks a child of this id.
+    pub fn checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
+        self.checkpoint_id = Some(checkpoint_id.into());
+        self
+    }
+
+    /// Saver for this run. The map belongs to `checkpointer`, not to the
+    /// process. Clone the `Arc` to share one thread across calls.
+    pub fn checkpointer(mut self, checkpointer: Arc<dyn Checkpointer>) -> Self {
+        self.checkpointer = Some(checkpointer);
+        self
+    }
+
+    /// Superstep budget stored on this config.
+    pub const fn get_recursion_limit(&self) -> u32 {
+        self.recursion_limit
+    }
+
+    /// Thread id, if one was set and it is not empty.
+    pub fn get_thread_id(&self) -> Option<&str> {
+        match self.thread_id.as_deref() {
+            Some(id) if !id.is_empty() => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Namespace stored on this config. Empty at the root.
+    pub fn get_checkpoint_ns(&self) -> &str {
+        &self.checkpoint_ns
+    }
+
+    /// Snapshot id stored on this config.
+    pub fn get_checkpoint_id(&self) -> Option<&str> {
+        self.checkpoint_id.as_deref()
+    }
+
+    /// Saver stored on this config.
+    pub fn get_checkpointer(&self) -> Option<&Arc<dyn Checkpointer>> {
+        self.checkpointer.as_ref()
+    }
+
+    /// Thread, namespace, and checkpoint id for a saver call.
+    ///
+    /// [`Error::MissingThreadId`] when [`RunConfig::get_thread_id`] is
+    /// `None`. The checkpointer is not part of the returned config.
+    pub fn checkpoint_config(&self) -> Result<CheckpointConfig, Error> {
+        let thread_id = self.get_thread_id().ok_or(Error::MissingThreadId)?;
+        Ok(CheckpointConfig {
+            thread_id: thread_id.to_string(),
+            checkpoint_ns: self.checkpoint_ns.clone(),
+            checkpoint_id: self.checkpoint_id.clone(),
+        })
+    }
+
+    fn at_checkpoint(&self, checkpoint_id: Option<String>) -> Self {
+        let mut config = self.clone();
+        config.checkpoint_id = checkpoint_id;
+        config
+    }
 }
+
+impl std::fmt::Debug for RunConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunConfig")
+            .field("recursion_limit", &self.recursion_limit)
+            .field("thread_id", &self.thread_id)
+            .field("checkpoint_ns", &self.checkpoint_ns)
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("checkpointer", &self.checkpointer.as_ref().map(|_| "saver"))
+            .finish()
+    }
+}
+
+impl PartialEq for RunConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.recursion_limit == other.recursion_limit
+            && self.thread_id == other.thread_id
+            && self.checkpoint_ns == other.checkpoint_ns
+            && self.checkpoint_id == other.checkpoint_id
+            && match (&self.checkpointer, &other.checkpointer) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for RunConfig {}
 
 impl Default for RunConfig {
     fn default() -> Self {
@@ -100,13 +216,32 @@ where
     ///
     /// Polling this future outside tokio returns [`Error::NoRuntime`]. A
     /// finished run returns the committed state. There is no `stream` method,
-    /// checkpoint, interrupt, `Send`, or `Command` on this call.
+    /// interrupt, `Send`, or `Command` on this call.
     ///
-    /// Checkpoint configuration extends [`RunConfig`]. Do not add a required
-    /// parameter to this method for it.
+    /// With a checkpointer, the call loads `config`'s checkpoint first
+    /// (`checkpoint_id` when set, otherwise the latest in the thread and
+    /// namespace). Input writes are then reduced into those channels. An
+    /// `add_messages` field appends. An overwrite field replaces. That
+    /// application is not a superstep.
+    ///
+    /// If the loaded checkpoint still has nodes scheduled, those nodes run.
+    /// The call does not start again from [`START`]. If nothing is scheduled,
+    /// or there is no checkpoint yet, `done:__start__` increments and the
+    /// entry nodes run on the merged state. An input checkpoint (`source:
+    /// Input`, step `-1` on a fresh thread) is stored after that preparation
+    /// and before the first superstep. Each committed superstep stores a
+    /// `Loop` checkpoint before the next superstep starts. `put` finishes
+    /// before that next superstep.
+    ///
+    /// A `checkpoint_id` loads that snapshot. The following `put` creates a
+    /// new checkpoint whose parent is the selected id. Older checkpoints,
+    /// including the previous tip, stay as they were.
     pub async fn invoke(&self, input: &S, config: &RunConfig) -> Result<S, Error> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(Error::NoRuntime);
+        }
+        if config.checkpointer.is_some() && config.get_thread_id().is_none() {
+            return Err(Error::MissingThreadId);
         }
         if config.recursion_limit < 1 {
             return Err(Error::GraphValidation(
@@ -114,19 +249,62 @@ where
             ));
         }
 
-        let mut channels = ChannelMap::new(S::schema())?;
-        channels.apply_writes(&input_writes(input)?)?;
-
         let nodes = node_map(&self.nodes);
         let known = Arc::new(nodes.keys().cloned().collect::<BTreeSet<_>>());
         let conditionals = Arc::new(self.conditional_edges.clone());
+        let saver = config.checkpointer.clone();
+
+        let mut channels = ChannelMap::new(S::schema())?;
         let mut control = Control::new();
-        // Input counts as one START completion. Entry edges read this version.
-        control.done.insert(START.to_string(), 1);
-        if conditionals.iter().any(|edge| edge.from == START) {
-            let state = channels.to_state::<S>()?;
-            let routes = route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
-            control.apply_routes(&routes);
+        let mut step = -1i64;
+        let mut parent_id: Option<String> = None;
+        let mut loaded = false;
+        if let Some(saver) = saver.as_ref() {
+            let lookup = config.checkpoint_config()?;
+            if let Some(tuple) = saver.get_tuple(&lookup).await.map_err(checkpoint_error)? {
+                let restored = restore_run::<S>(&tuple.checkpoint)?;
+                channels = restored.0;
+                control = restored.1;
+                step = tuple.metadata.step;
+                parent_id = Some(tuple.checkpoint.id);
+                loaded = true;
+            }
+        }
+
+        let writes = input_writes(input)?;
+        let input_channels = channel_names(&writes);
+        channels.apply_writes(&writes)?;
+
+        let pending = schedule(&self.edges, &nodes, &control);
+        if !loaded || pending.is_empty() {
+            // A fresh run, a finished thread, or a call with no saver.
+            // Entry edges read the new START completion.
+            control.bump_done(START);
+            if conditionals.iter().any(|edge| edge.from == START) {
+                let state = channels.to_state::<S>()?;
+                let routes = route_from(conditionals.as_slice(), START, &state, known.as_ref())?;
+                control.apply_routes(&routes);
+            }
+        }
+
+        if let Some(saver) = saver.as_ref() {
+            parent_id = Some(
+                save_checkpoint(
+                    saver.as_ref(),
+                    config,
+                    parent_id.as_deref(),
+                    SavedStep {
+                        channels: &channels,
+                        control: &control,
+                        updated: &input_channels,
+                        source: CheckpointSource::Input,
+                        step,
+                    },
+                )
+                .await?
+                .checkpoint_id
+                .ok_or_else(|| Error::Checkpoint("saver did not return a checkpoint id".into()))?,
+            );
         }
 
         let mut completed_supersteps = 0u32;
@@ -138,7 +316,7 @@ where
             if completed_supersteps == config.recursion_limit {
                 return Err(Error::RecursionLimit(config.recursion_limit));
             }
-            run_superstep(
+            let updated = run_superstep(
                 &mut channels,
                 &mut control,
                 &nodes,
@@ -148,8 +326,210 @@ where
             )
             .await?;
             completed_supersteps += 1;
+            if let Some(saver) = saver.as_ref() {
+                step += 1;
+                parent_id = Some(
+                    save_checkpoint(
+                        saver.as_ref(),
+                        config,
+                        parent_id.as_deref(),
+                        SavedStep {
+                            channels: &channels,
+                            control: &control,
+                            updated: &updated,
+                            source: CheckpointSource::Loop,
+                            step,
+                        },
+                    )
+                    .await?
+                    .checkpoint_id
+                    .ok_or_else(|| {
+                        Error::Checkpoint("saver did not return a checkpoint id".into())
+                    })?,
+                );
+            }
         }
     }
+
+    /// Load the checkpoint selected by `config`.
+    ///
+    /// The snapshot carries the channel values as `S`, the node names the
+    /// next superstep would run, the config for this checkpoint, the parent
+    /// config, and those pending nodes as tasks. `interrupts` is empty.
+    ///
+    /// No checkpointer is [`Error::Checkpoint`]. A checkpointer without a
+    /// thread id is [`Error::MissingThreadId`]. A thread with no checkpoint
+    /// is [`Error::Checkpoint`].
+    pub async fn get_state(&self, config: &RunConfig) -> Result<StateSnapshot<S>, Error> {
+        require_runtime()?;
+        let saver = require_saver(config)?;
+        let lookup = config.checkpoint_config()?;
+        let tuple = saver
+            .get_tuple(&lookup)
+            .await
+            .map_err(checkpoint_error)?
+            .ok_or_else(|| Error::Checkpoint("no checkpoint for this thread".into()))?;
+        self.snapshot(config, &tuple)
+    }
+
+    /// Checkpoints for `config`'s thread and namespace, newest first.
+    ///
+    /// `before` and `limit` are forwarded to [`Checkpointer::list`]. This
+    /// walks the stored list. It does not follow only the parent chain, so a
+    /// fork leaves the previous tip in the result.
+    pub async fn get_state_history(
+        &self,
+        config: &RunConfig,
+        before: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StateSnapshot<S>>, Error> {
+        require_runtime()?;
+        let saver = require_saver(config)?;
+        let lookup = config.checkpoint_config()?;
+        let tuples = saver
+            .list(&lookup, before, limit)
+            .await
+            .map_err(checkpoint_error)?;
+        tuples
+            .iter()
+            .map(|tuple| self.snapshot(config, tuple))
+            .collect()
+    }
+
+    /// Write `values` as if `as_node` finished, and store an `Update` checkpoint.
+    ///
+    /// No node function runs. `as_node`'s triggers are marked consumed, its
+    /// completion count increments, and its conditional routers run on the
+    /// merged state. The next superstep is that node's successors. `START`
+    /// is a legal `as_node` and schedules the entry nodes.
+    ///
+    /// The returned config points at the new checkpoint and keeps the same
+    /// saver, thread, namespace, and recursion limit. A `checkpoint_id` on
+    /// `config` selects the parent snapshot. The previous tip stays in
+    /// history.
+    pub async fn update_state(
+        &self,
+        config: &RunConfig,
+        values: &S::Update,
+        as_node: &str,
+    ) -> Result<RunConfig, Error> {
+        require_runtime()?;
+        let saver = require_saver(config)?;
+        if as_node != START && !self.nodes.iter().any(|(name, _)| name == as_node) {
+            return Err(Error::UnknownNode(as_node.to_string()));
+        }
+
+        let lookup = config.checkpoint_config()?;
+        let loaded = saver.get_tuple(&lookup).await.map_err(checkpoint_error)?;
+        let (mut channels, mut control, step, parent_id) = match &loaded {
+            Some(tuple) => {
+                let (channels, control) = restore_run::<S>(&tuple.checkpoint)?;
+                (
+                    channels,
+                    control,
+                    tuple.metadata.step.saturating_add(1),
+                    Some(tuple.checkpoint.id.clone()),
+                )
+            }
+            None => (ChannelMap::new(S::schema())?, Control::new(), -1, None),
+        };
+
+        let writes = S::update_to_writes(values, &[], as_node)?;
+        let updated = channel_names(&writes);
+        channels.apply_writes(&writes)?;
+        if as_node == START {
+            control.bump_done(START);
+        } else {
+            let consumed = incoming_triggers(&self.edges, as_node, &control);
+            control.mark_consumed(as_node, &consumed);
+            control.bump_done(as_node);
+        }
+        if self
+            .conditional_edges
+            .iter()
+            .any(|edge| edge.from == as_node)
+        {
+            let known = self
+                .nodes
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<BTreeSet<_>>();
+            let state = channels.to_state::<S>()?;
+            let routes = route_from(&self.conditional_edges, as_node, &state, &known)?;
+            control.apply_routes(&routes);
+        }
+
+        let saved = save_checkpoint(
+            saver.as_ref(),
+            config,
+            parent_id.as_deref(),
+            SavedStep {
+                channels: &channels,
+                control: &control,
+                updated: &updated,
+                source: CheckpointSource::Update,
+                step,
+            },
+        )
+        .await?;
+        Ok(config.at_checkpoint(saved.checkpoint_id))
+    }
+
+    fn snapshot(
+        &self,
+        config: &RunConfig,
+        tuple: &CheckpointTuple,
+    ) -> Result<StateSnapshot<S>, Error> {
+        let (channels, control) = restore_run::<S>(&tuple.checkpoint)?;
+        let nodes = node_map(&self.nodes);
+        let next = schedule(&self.edges, &nodes, &control)
+            .into_iter()
+            .map(|task| task.name)
+            .collect::<Vec<_>>();
+        let tasks = next
+            .iter()
+            .map(|name| PendingTask { name: name.clone() })
+            .collect();
+        let parent_config = tuple
+            .parent_config
+            .as_ref()
+            .map(|parent| config.at_checkpoint(parent.checkpoint_id.clone()));
+        Ok(StateSnapshot {
+            values: channels.to_state()?,
+            next,
+            config: config.at_checkpoint(Some(tuple.checkpoint.id.clone())),
+            parent_config,
+            tasks,
+            interrupts: Vec::new(),
+            metadata: tuple.metadata.clone(),
+        })
+    }
+}
+
+/// Channel values and scheduling position of one checkpoint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSnapshot<S> {
+    /// State reconstructed from the checkpoint's channel values.
+    pub values: S,
+    /// Node names the next superstep would run, in name order.
+    pub next: Vec<String>,
+    /// Config that loads this checkpoint, including the same saver.
+    pub config: RunConfig,
+    /// Config of the parent checkpoint in this namespace.
+    pub parent_config: Option<RunConfig>,
+    /// One task per name in [`StateSnapshot::next`].
+    pub tasks: Vec<PendingTask>,
+    /// Always empty. Interrupts are a later milestone.
+    pub interrupts: Vec<serde_json::Value>,
+    /// Source, step, and parent ids stored with the checkpoint.
+    pub metadata: CheckpointMetadata,
+}
+
+/// A node that would run on the next superstep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTask {
+    /// Node name. One task per node until `Send` exists.
+    pub name: String,
 }
 
 struct Control {
@@ -475,7 +855,7 @@ async fn run_superstep<S>(
     conditionals: &Arc<Vec<ConditionalEdge<S>>>,
     known: &Arc<BTreeSet<String>>,
     scheduled: Vec<Scheduled>,
-) -> Result<(), Error>
+) -> Result<Vec<String>, Error>
 where
     S: GraphState + Send + Sync + 'static,
     S::Update: Send + 'static,
@@ -535,7 +915,118 @@ where
     for result in &results {
         control.apply_routes(&result.routed);
     }
-    Ok(())
+    Ok(channel_names(&writes))
+}
+
+fn require_runtime() -> Result<(), Error> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        Err(Error::NoRuntime)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_saver(config: &RunConfig) -> Result<&Arc<dyn Checkpointer>, Error> {
+    config
+        .get_checkpointer()
+        .ok_or_else(|| Error::Checkpoint("no checkpointer configured".into()))
+}
+
+fn checkpoint_error(error: langgraph_checkpoint::Error) -> Error {
+    Error::Checkpoint(error.to_string())
+}
+
+fn restore_run<S: GraphState>(checkpoint: &Checkpoint) -> Result<(ChannelMap, Control), Error> {
+    let mut channels = ChannelMap::new(S::schema())?;
+    channels.restore(&checkpoint.channel_values, &checkpoint.channel_versions)?;
+    let control = Control {
+        done: checkpoint.done.clone(),
+        branch: checkpoint.branch.clone(),
+        seen: checkpoint.versions_seen.clone(),
+    };
+    Ok((channels, control))
+}
+
+fn channel_names(writes: &[Write]) -> Vec<String> {
+    writes
+        .iter()
+        .map(|write| write.channel.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn new_versions(channels: &ChannelMap, updated: &[String]) -> Result<BTreeMap<String, u64>, Error> {
+    let mut versions = BTreeMap::new();
+    for name in updated {
+        let version = channels.version(name).ok_or_else(|| {
+            Error::Checkpoint(format!("updated channel '{name}' is not in the schema"))
+        })?;
+        versions.insert(name.clone(), version);
+    }
+    Ok(versions)
+}
+
+struct SavedStep<'a> {
+    channels: &'a ChannelMap,
+    control: &'a Control,
+    updated: &'a [String],
+    source: CheckpointSource,
+    step: i64,
+}
+
+async fn save_checkpoint(
+    saver: &dyn Checkpointer,
+    config: &RunConfig,
+    parent_id: Option<&str>,
+    step: SavedStep<'_>,
+) -> Result<CheckpointConfig, Error> {
+    let mut stored = config.checkpoint_config()?;
+    stored.checkpoint_id = parent_id.map(str::to_string);
+    let checkpoint = Checkpoint {
+        v: 1,
+        id: langgraph_checkpoint::new_checkpoint_id(),
+        ts: langgraph_checkpoint::checkpoint_timestamp(),
+        channel_values: step.channels.values(),
+        channel_versions: step.channels.versions(),
+        versions_seen: step.control.seen.clone(),
+        updated_channels: step.updated.to_vec(),
+        done: step.control.done.clone(),
+        branch: step.control.branch.clone(),
+    };
+    let metadata = CheckpointMetadata {
+        source: step.source,
+        step: step.step,
+        parents: BTreeMap::new(),
+    };
+    let versions = new_versions(step.channels, step.updated)?;
+    saver
+        .put(&stored, &checkpoint, &metadata, &versions)
+        .await
+        .map_err(checkpoint_error)
+}
+
+fn incoming_triggers(edges: &[Edge], node: &str, control: &Control) -> Vec<(String, u64)> {
+    let mut consumed = BTreeMap::<String, u64>::new();
+    for edge in edges {
+        if edge.target != node {
+            continue;
+        }
+        let keys = match &edge.source {
+            EdgeSource::One(source) => vec![done_key(source)],
+            EdgeSource::Wait(sources) => sources.iter().map(|source| done_key(source)).collect(),
+        };
+        for key in keys {
+            let version = control.version(&key);
+            consumed.insert(key, version);
+        }
+    }
+    for key in control.branch.keys() {
+        if branch_destination(key) == Some(node) {
+            consumed.insert(key.clone(), control.version(key));
+        }
+    }
+    consumed.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -694,6 +1185,11 @@ mod tests {
         assert_eq!(DEFAULT_RECURSION_LIMIT, 25);
         assert_eq!(RunConfig::default(), RunConfig::new());
         assert_ne!(RunConfig::new().recursion_limit(1), RunConfig::new());
+        assert_eq!(RunConfig::new().get_recursion_limit(), 25);
+        assert_eq!(RunConfig::new().get_thread_id(), None);
+        assert_eq!(RunConfig::new().get_checkpoint_ns(), "");
+        assert_eq!(RunConfig::new().get_checkpoint_id(), None);
+        assert!(RunConfig::new().get_checkpointer().is_none());
     }
 
     #[test]
@@ -1021,6 +1517,18 @@ mod tests {
             .expect("cycle ends");
         assert_eq!(result.count, 3);
         assert_eq!(result.tag, "kept");
+
+        let with_thread = graph
+            .invoke(
+                &input,
+                &RunConfig::new()
+                    .thread_id("ignored")
+                    .checkpoint_id("also-ignored"),
+            )
+            .await
+            .expect("thread id without a saver");
+        assert_eq!(with_thread.count, 3);
+        assert_eq!(with_thread.tag, "kept");
     }
 
     #[tokio::test]

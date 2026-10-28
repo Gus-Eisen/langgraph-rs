@@ -1,6 +1,6 @@
 [package]
 name = "langgraph-core"
-description = "State channels, reducers, the graph builder, and the Pregel runtime for langgraph-rs."
+description = "State channels, reducers, the graph builder, the Pregel runtime, and checkpoint resume for langgraph-rs."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

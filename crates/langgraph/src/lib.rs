@@ -1,18 +1,23 @@
 //! LangGraph for Rust.
 //!
 //! This crate is the public facade. It re-exports state channels, reducers,
-//! `add_messages`, the graph builder, and Pregel `invoke` from
-//! `langgraph-core`. `compile` checks a graph. `CompiledGraph::invoke` runs
-//! it. The checkpointer and prebuilt agent are later milestones. See the
-//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
+//! `add_messages`, the graph builder, Pregel `invoke`, and the in-memory
+//! checkpointer. `compile` checks a graph. `CompiledGraph::invoke` runs it.
+//! The prebuilt agent is a later milestone. See the repository `ROADMAP.md`
+//! and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
+pub use langgraph_checkpoint::{
+    checkpoint_timestamp, new_checkpoint_id, BoxFuture, Checkpoint, CheckpointConfig,
+    CheckpointMetadata, CheckpointSource, CheckpointTuple, Checkpointer, Error as CheckpointError,
+    InMemorySaver, PendingWrite,
+};
 pub use langgraph_core::{
     add_messages, AsyncNodeMarker, ChannelMap, CompiledGraph, CustomReducer, EdgeSource, Error,
-    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, Reducer, Route, RunConfig,
-    SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES, RESERVED_NAMES,
-    START,
+    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, PendingTask, Reducer, Route,
+    RunConfig, StateSnapshot, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END,
+    REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
 };
 
 /// Version of this facade crate.

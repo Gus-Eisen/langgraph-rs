@@ -6,8 +6,8 @@
 //! `(task_path, task_id, write_index)` order. [`GraphBuilder`] records nodes
 //! and edges. [`GraphBuilder::compile`] checks that structure.
 //! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
-//! runtime. Checkpointing is a later milestone. See the repository
-//! `ARCHITECTURE.md`.
+//! runtime. A checkpointer on [`RunConfig`] stores each superstep and can
+//! resume a thread. See the repository `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
@@ -25,15 +25,15 @@ pub use builder::{
 pub use error::Error;
 pub use messages::{add_messages, REMOVE_ALL_MESSAGES};
 pub use reducer::{CustomReducer, Field, Reducer};
-pub use runtime::{RunConfig, DEFAULT_RECURSION_LIMIT};
+pub use runtime::{PendingTask, RunConfig, StateSnapshot, DEFAULT_RECURSION_LIMIT};
 pub use state::{ChannelMap, GraphState, Write, RESERVED_NAMES};
 
 /// Version of `langgraph-core`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Version of the checkpoint crate the runtime will call.
+/// Version of the checkpoint crate the runtime calls.
 ///
-/// The checkpointer API is not re-exported here.
+/// Saver types are re-exported by the `langgraph` facade, not from this crate.
 pub const CHECKPOINT_VERSION: &str = langgraph_checkpoint::VERSION;
 
 #[cfg(test)]
