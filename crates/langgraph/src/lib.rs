@@ -1,17 +1,18 @@
 //! LangGraph for Rust.
 //!
 //! This crate is the public facade. It re-exports state channels, reducers,
-//! `add_messages`, and the graph builder from `langgraph-core`. `compile`
-//! checks a graph and does not run it. The Pregel runtime, checkpointer, and
-//! prebuilt agent are later milestones. See the repository `ROADMAP.md` and
-//! `ARCHITECTURE.md`.
+//! `add_messages`, the graph builder, and Pregel `invoke` from
+//! `langgraph-core`. `compile` checks a graph. `CompiledGraph::invoke` runs
+//! it. The checkpointer and prebuilt agent are later milestones. See the
+//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
 pub use langgraph_core::{
     add_messages, AsyncNodeMarker, ChannelMap, CompiledGraph, CustomReducer, EdgeSource, Error,
-    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, Reducer, Route, SyncNodeMarker,
-    Write, END, REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
+    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, Reducer, Route, RunConfig,
+    SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES, RESERVED_NAMES,
+    START,
 };
 
 /// Version of this facade crate.
@@ -61,5 +62,15 @@ mod tests {
         assert!(crate::RESERVED_NAMES.contains(&crate::START));
         assert!(crate::RESERVED_NAMES.contains(&crate::END));
         assert_eq!(crate::Route::end().destinations(), ["__end__".to_string()]);
+    }
+
+    #[test]
+    fn facade_reexports_the_recursion_limit() {
+        assert_eq!(crate::DEFAULT_RECURSION_LIMIT, 25);
+        assert_eq!(crate::RunConfig::default(), crate::RunConfig::new());
+        assert_ne!(
+            crate::RunConfig::new().recursion_limit(1),
+            crate::RunConfig::default()
+        );
     }
 }

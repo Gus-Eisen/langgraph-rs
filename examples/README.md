@@ -1,5 +1,9 @@
 # Examples
 
-The looping-graph demo is not in the tree yet. The Pregel runtime milestone in [ROADMAP.md](../ROADMAP.md) adds `examples/looping_graph.rs`: one node updates a counter, a conditional edge routes back to that node until the counter reaches a limit, then routes to `END`.
+`looping_graph` is one node that updates a counter. A conditional edge routes back to that node until the counter reaches a limit, then routes to `END`.
 
-No example crate target is checked in before that milestone, so `cargo test` has nothing here to compile.
+```bash
+cargo run --example looping_graph
+```
+
+The example is in-memory. It does not call a model or the network.

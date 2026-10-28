@@ -2,7 +2,9 @@
 //!
 //! Channel folds return [`Error::InvalidUpdate`]. Schema checks and
 //! [`crate::GraphBuilder::compile`] return [`Error::GraphValidation`].
-//! Later milestones add variants to this enum.
+//! [`crate::CompiledGraph::invoke`] adds [`Error::UnknownNode`],
+//! [`Error::RecursionLimit`], [`Error::NoRuntime`], and [`Error::Node`].
+//! Later milestones add further variants to this enum.
 
 use thiserror::Error;
 
@@ -25,6 +27,35 @@ pub enum Error {
     /// names on nodes and fields, and rejects edges that do not connect
     /// [`crate::START`], registered nodes, and [`crate::END`]. Reading a map
     /// with a different [`crate::GraphState`] schema fails the same way.
+    /// A recursion limit below 1 is the same variant.
     #[error("graph validation: {0}")]
     GraphValidation(String),
+
+    /// A router returned a name that is not [`crate::END`] and not a node.
+    ///
+    /// With a static path map, the router's label is mapped first. A label
+    /// the map does not contain is this variant. Without a path map, the
+    /// router is expected to return node names directly.
+    #[error("unknown node: {0}")]
+    UnknownNode(String),
+
+    /// The run would start a superstep past the recursion limit.
+    ///
+    /// The value is the limit. The refused step is not executed, and the
+    /// failed step's writes are not committed. Input writes are not a
+    /// superstep and do not count against this limit.
+    #[error("recursion limit of {0} supersteps reached")]
+    RecursionLimit(u32),
+
+    /// [`crate::CompiledGraph::invoke`] was polled outside a tokio runtime.
+    #[error("no tokio runtime is available")]
+    NoRuntime,
+
+    /// A node returned [`Err`](Result::Err), or its task panicked and was
+    /// cancelled.
+    ///
+    /// Sibling tasks in the superstep are joined first. None of that step's
+    /// writes are committed.
+    #[error("node '{node}' failed: {message}")]
+    Node { node: String, message: String },
 }

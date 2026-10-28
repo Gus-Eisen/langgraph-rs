@@ -16,3 +16,9 @@ langgraph-prebuilt = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[[example]]
+name = "looping_graph"
+path = "../../examples/looping_graph.rs"
+

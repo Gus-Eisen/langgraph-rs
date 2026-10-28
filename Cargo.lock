@@ -75,6 +75,7 @@ dependencies = [
  "langgraph-llm",
  "langgraph-prebuilt",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
