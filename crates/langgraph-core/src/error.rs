@@ -53,7 +53,8 @@ pub enum Error {
     #[error("recursion limit of {0} supersteps reached")]
     RecursionLimit(u32),
 
-    /// [`crate::CompiledGraph::invoke`] was polled outside a tokio runtime.
+    /// [`crate::CompiledGraph::invoke`] or [`crate::CompiledGraph::stream`]
+    /// was polled outside a tokio runtime.
     #[error("no tokio runtime is available")]
     NoRuntime,
 

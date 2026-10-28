@@ -3,10 +3,12 @@
 //! This crate is the public facade. It re-exports state channels, reducers,
 //! `add_messages`, the graph builder, Pregel `invoke`, and the checkpointers.
 //! `compile` checks a graph. `CompiledGraph::invoke` runs it and returns
-//! [`RunOutput`]. `interrupt` pauses a node until [`Resume`] supplies a
-//! value. [`Command`] carries that resume on `invoke`, and a node may return
-//! `Command` to update state and `goto` the next nodes. A conditional router
-//! may return [`Send`]. `InMemorySaver` keeps a
+//! [`RunOutput`]. `CompiledGraph::stream` yields that run as `values`,
+//! `updates`, and `events`. `interrupt` pauses a node until [`Resume`]
+//! supplies a value. [`Command`] carries that resume on `invoke` and
+//! `stream`, and a node may return `Command` to update state and `goto` the
+//! next nodes. A conditional router may return [`Send`]. `InMemorySaver`
+//! keeps a
 //! thread in memory. `SqliteSaver::open`
 //! keeps the same checkpoints in a SQLite file. The prebuilt agent is a
 //! later milestone. See the repository `ROADMAP.md` and `ARCHITECTURE.md`.
@@ -21,10 +23,10 @@ pub use langgraph_checkpoint::{
 pub use langgraph_core::{
     add_messages, interrupt, interrupt_id, AsyncCommandMarker, AsyncNodeMarker, ChannelMap,
     Command, CompiledGraph, CustomReducer, EdgeSource, Error, Field, GraphBuilder, GraphState,
-    GraphTarget, Interrupt, InterruptNodes, IntoEdgeSource, IntoRoute, InvokeInput, PendingTask,
-    Reducer, Resume, Route, RouteTarget, RunConfig, RunInput, RunOutput, Send, StateSnapshot,
-    SyncCommandMarker, SyncNodeMarker, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES,
-    RESERVED_NAMES, START,
+    GraphStream, GraphTarget, Interrupt, InterruptNodes, IntoEdgeSource, IntoRoute, InvokeInput,
+    Namespace, PendingTask, Reducer, Resume, Route, RouteTarget, RunConfig, RunInput, RunOutput,
+    Send, StateSnapshot, StreamEvent, StreamMode, StreamModes, SyncCommandMarker, SyncNodeMarker,
+    TaskResult, Write, DEFAULT_RECURSION_LIMIT, END, REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
 };
 
 /// Version of this facade crate.
@@ -127,6 +129,24 @@ mod tests {
         assert_eq!(send.value["tag"], "a");
         let targets = crate::IntoRoute::into_targets(crate::RouteTarget::Send(send));
         assert!(matches!(targets.as_slice(), [crate::RouteTarget::Send(_)]));
+    }
+
+    #[test]
+    fn facade_reexports_stream_types() {
+        let modes = crate::StreamModes::values()
+            | crate::StreamModes::updates()
+            | crate::StreamMode::Events;
+        assert_eq!(modes, crate::StreamModes::all());
+        assert!(crate::Namespace::root().is_root());
+        assert_eq!(
+            crate::Namespace::root().join("child").parts(),
+            ["child".to_string()]
+        );
+        let _mode = crate::StreamMode::Values;
+        match crate::TaskResult::<i64>::Update(Some(1)) {
+            crate::TaskResult::Update(Some(1)) => {}
+            other => panic!("expected update, got {other:?}"),
+        }
     }
 
     #[test]
