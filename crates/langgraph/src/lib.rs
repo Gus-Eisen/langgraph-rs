@@ -1,15 +1,17 @@
 //! LangGraph for Rust.
 //!
 //! This crate is the public facade. It re-exports state channels, reducers,
-//! and `add_messages` from `langgraph-core`. The graph builder, Pregel
-//! runtime, checkpointer, and prebuilt agent are later milestones. See the
-//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
+//! `add_messages`, and the graph builder from `langgraph-core`. `compile`
+//! checks a graph and does not run it. The Pregel runtime, checkpointer, and
+//! prebuilt agent are later milestones. See the repository `ROADMAP.md` and
+//! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
 pub use langgraph_core::{
-    add_messages, ChannelMap, CustomReducer, Error, Field, GraphState, Reducer, Write,
-    REMOVE_ALL_MESSAGES, RESERVED_NAMES,
+    add_messages, AsyncNodeMarker, ChannelMap, CompiledGraph, CustomReducer, EdgeSource, Error,
+    Field, GraphBuilder, GraphState, IntoEdgeSource, IntoRoute, Reducer, Route, SyncNodeMarker,
+    Write, END, REMOVE_ALL_MESSAGES, RESERVED_NAMES, START,
 };
 
 /// Version of this facade crate.
@@ -50,5 +52,14 @@ mod tests {
         assert_eq!(crate::REMOVE_ALL_MESSAGES, "__remove_all__");
         let _add_messages = crate::add_messages;
         let _kind = crate::Reducer::AddMessages;
+    }
+
+    #[test]
+    fn facade_reexports_the_builder_sentinels() {
+        assert_eq!(crate::START, "__start__");
+        assert_eq!(crate::END, "__end__");
+        assert!(crate::RESERVED_NAMES.contains(&crate::START));
+        assert!(crate::RESERVED_NAMES.contains(&crate::END));
+        assert_eq!(crate::Route::end().destinations(), ["__end__".to_string()]);
     }
 }

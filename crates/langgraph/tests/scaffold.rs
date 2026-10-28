@@ -1,7 +1,7 @@
-//! Smoke test for the milestone 0 workspace.
+//! Smoke test for the workspace facade.
 //!
-//! The graph API is intentionally absent. This checks that the facade links
-//! the crates named in `ARCHITECTURE.md`.
+//! The graph builder is covered in `builder.rs`. This checks that the facade
+//! links the crates named in `ARCHITECTURE.md`.
 
 #[test]
 fn workspace_facade_links_planned_crates() {

@@ -3,16 +3,23 @@
 //! Channels are a JSON map with `u64` versions. [`GraphState`] supplies the
 //! field list, partial updates, and conversion to and from those values.
 //! Overwrite, append, custom, and `add_messages` reducers fold a step in
-//! `(task_path, task_id, write_index)` order. The builder and the Pregel
-//! runtime are later milestones. See the repository `ARCHITECTURE.md`.
+//! `(task_path, task_id, write_index)` order. [`GraphBuilder`] records nodes
+//! and edges. [`GraphBuilder::compile`] checks that structure and does not
+//! run the graph. The Pregel runtime is a later milestone. See the repository
+//! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
+mod builder;
 mod error;
 mod messages;
 mod reducer;
 mod state;
 
+pub use builder::{
+    AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, IntoEdgeSource, IntoRoute, Route,
+    SyncNodeMarker, END, START,
+};
 pub use error::Error;
 pub use messages::{add_messages, REMOVE_ALL_MESSAGES};
 pub use reducer::{CustomReducer, Field, Reducer};

@@ -316,7 +316,7 @@ impl ChannelMap {
 
 /// Reducer kinds match. Custom folds match as a kind; function pointers are
 /// not compared.
-fn same_reducer(left: Reducer, right: Reducer) -> bool {
+pub(crate) fn same_reducer(left: Reducer, right: Reducer) -> bool {
     matches!(
         (left, right),
         (Reducer::Overwrite, Reducer::Overwrite)
