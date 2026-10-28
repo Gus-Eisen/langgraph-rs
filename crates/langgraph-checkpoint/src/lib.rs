@@ -19,7 +19,7 @@ pub use memory::InMemorySaver;
 pub use sqlite::SqliteSaver;
 pub use types::{
     checkpoint_timestamp, new_checkpoint_id, BoxFuture, Checkpoint, CheckpointConfig,
-    CheckpointMetadata, CheckpointSource, CheckpointTuple, PendingWrite,
+    CheckpointMetadata, CheckpointSend, CheckpointSource, CheckpointTuple, PendingWrite,
 };
 
 use std::collections::BTreeMap;

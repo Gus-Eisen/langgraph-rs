@@ -70,7 +70,30 @@ pub struct Checkpoint {
     /// Completion counts keyed by node name, including `__start__`.
     pub done: BTreeMap<String, u64>,
     /// Conditional selections keyed by `branch:{edge_index}:{dest}`.
+    ///
+    /// A plain node name bumps one entry. Duplicate names from the same edge
+    /// share that entry. Fan-out packets live in [`Checkpoint::sends`] and
+    /// are not deduped into this map.
     pub branch: BTreeMap<String, u64>,
+    /// Fan-out packets waiting for the next superstep, in router order.
+    ///
+    /// Each packet is its own task. Older checkpoints omit this field.
+    #[serde(default)]
+    pub sends: Vec<CheckpointSend>,
+}
+
+/// One fan-out packet stored on a [`Checkpoint`].
+///
+/// `value` is a JSON object. The runtime merges it onto a clone of the
+/// committed channel values to form that task's input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointSend {
+    /// Conditional edge that returned this packet, in registration order.
+    pub edge_index: usize,
+    /// Node the next superstep runs.
+    pub node: String,
+    /// JSON object merged onto the committed snapshot for this task.
+    pub value: Value,
 }
 
 impl Checkpoint {
@@ -88,6 +111,7 @@ impl Checkpoint {
             updated_channels: Vec::new(),
             done: BTreeMap::new(),
             branch: BTreeMap::new(),
+            sends: Vec::new(),
         }
     }
 }

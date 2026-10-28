@@ -77,7 +77,14 @@ fn facade_compiles_a_cycle_without_running_nodes() {
 #[test]
 fn facade_route_and_edge_traits_convert() {
     fn destinations<T: langgraph::IntoRoute>(value: T) -> Vec<String> {
-        value.into_destinations()
+        value
+            .into_targets()
+            .into_iter()
+            .map(|target| match target {
+                langgraph::RouteTarget::Node(name) => name,
+                langgraph::RouteTarget::Send(send) => send.node,
+            })
+            .collect()
     }
     fn source<T: langgraph::IntoEdgeSource>(value: T) -> langgraph::EdgeSource {
         value.into_edge_source()

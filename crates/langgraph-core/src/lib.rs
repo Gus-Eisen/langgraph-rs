@@ -8,7 +8,8 @@
 //! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
 //! runtime. A checkpointer on [`RunConfig`] stores each superstep and can
 //! resume a thread. [`interrupt`] pauses a node until [`Resume`] supplies a
-//! value. See the repository `ARCHITECTURE.md`.
+//! value. A conditional router may return [`Send`]. See the repository
+//! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
@@ -21,8 +22,8 @@ mod runtime;
 mod state;
 
 pub use builder::{
-    AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, InterruptNodes, IntoEdgeSource,
-    IntoRoute, Route, SyncNodeMarker, END, START,
+    packet::Send, AsyncNodeMarker, CompiledGraph, EdgeSource, GraphBuilder, InterruptNodes,
+    IntoEdgeSource, IntoRoute, Route, RouteTarget, SyncNodeMarker, END, START,
 };
 pub use error::Error;
 pub use interrupt::{interrupt, interrupt_id, Interrupt, Resume, RunOutput};
