@@ -1,14 +1,15 @@
 //! LangGraph for Rust.
 //!
-//! This crate is the public facade. It re-exports state channels and reducers
-//! from `langgraph-core`. The graph builder, Pregel runtime, checkpointer,
-//! and prebuilt agent are later milestones. See the repository `ROADMAP.md`
-//! and `ARCHITECTURE.md`.
+//! This crate is the public facade. It re-exports state channels, reducers,
+//! and `add_messages` from `langgraph-core`. The graph builder, Pregel
+//! runtime, checkpointer, and prebuilt agent are later milestones. See the
+//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
 pub use langgraph_core::{
-    ChannelMap, CustomReducer, Error, Field, GraphState, Reducer, Write, RESERVED_NAMES,
+    add_messages, ChannelMap, CustomReducer, Error, Field, GraphState, Reducer, Write,
+    REMOVE_ALL_MESSAGES, RESERVED_NAMES,
 };
 
 /// Version of this facade crate.
@@ -42,5 +43,12 @@ mod tests {
         assert!(crate::LINKED_CRATES
             .iter()
             .all(|(_, version)| !version.is_empty()));
+    }
+
+    #[test]
+    fn facade_reexports_the_message_reducer() {
+        assert_eq!(crate::REMOVE_ALL_MESSAGES, "__remove_all__");
+        let _add_messages = crate::add_messages;
+        let _kind = crate::Reducer::AddMessages;
     }
 }

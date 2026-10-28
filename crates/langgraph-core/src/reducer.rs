@@ -34,6 +34,12 @@ pub enum Reducer {
     Append,
     /// Caller-supplied left fold. See [`CustomReducer`].
     Custom(CustomReducer),
+    /// Merge message JSON with [`crate::add_messages`].
+    ///
+    /// Each write is one message object or an array of messages. A missing
+    /// committed value is an empty list. Writes in one step fold left to
+    /// right in task order. A failed merge does not commit the step.
+    AddMessages,
 }
 
 /// One state field: a channel name and its reducer.

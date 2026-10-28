@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::messages::add_messages;
 use crate::reducer::{CustomReducer, Field, Reducer};
 
 /// Names that cannot be state fields.
@@ -227,8 +228,8 @@ impl ChannelMap {
     /// its schema reducer and its version increases by 1. Channels with no
     /// writes are left alone, including their versions.
     ///
-    /// On [`Error::InvalidUpdate`] the map is unchanged: a failed overwrite
-    /// or append does not commit any channel in the step.
+    /// On [`Error::InvalidUpdate`] the map is unchanged: a failed fold does
+    /// not commit any channel in the step.
     pub fn apply_writes(&mut self, writes: &[Write]) -> Result<(), Error> {
         let grouped = group_writes(writes)?;
         for name in grouped.keys() {
@@ -278,10 +279,21 @@ impl ChannelMap {
         }
         for (name, value) in values {
             let reducer = self.channels[name].reducer;
-            if matches!(reducer, Reducer::Append) && !value.is_array() {
-                return Err(Error::InvalidUpdate(format!(
-                    "channel '{name}' append reducer expected a JSON array"
-                )));
+            match reducer {
+                Reducer::Append if !value.is_array() => {
+                    return Err(Error::InvalidUpdate(format!(
+                        "channel '{name}' append reducer expected a JSON array"
+                    )));
+                }
+                Reducer::AddMessages if !value.is_array() => {
+                    return Err(Error::InvalidUpdate(format!(
+                        "channel '{name}' add_messages reducer expected a JSON array"
+                    )));
+                }
+                Reducer::Overwrite
+                | Reducer::Custom(_)
+                | Reducer::Append
+                | Reducer::AddMessages => {}
             }
         }
         for (name, value) in values {
@@ -310,6 +322,7 @@ fn same_reducer(left: Reducer, right: Reducer) -> bool {
         (Reducer::Overwrite, Reducer::Overwrite)
             | (Reducer::Append, Reducer::Append)
             | (Reducer::Custom(_), Reducer::Custom(_))
+            | (Reducer::AddMessages, Reducer::AddMessages)
     )
 }
 
@@ -349,6 +362,7 @@ fn fold_writes(
         Reducer::Overwrite => fold_overwrite(channel, writes),
         Reducer::Append => fold_append(channel, current, writes),
         Reducer::Custom(reduce) => fold_custom(reduce, current, writes),
+        Reducer::AddMessages => fold_add_messages(channel, current, writes),
     }
 }
 
@@ -384,6 +398,26 @@ fn fold_append(channel: &str, current: Option<&Value>, writes: &[&Write]) -> Res
         }
     }
     Ok(Value::Array(combined))
+}
+
+fn fold_add_messages(
+    channel: &str,
+    current: Option<&Value>,
+    writes: &[&Write],
+) -> Result<Value, Error> {
+    let mut accumulated = match current {
+        Some(value) => value.clone(),
+        None => Value::Array(Vec::new()),
+    };
+    for write in writes {
+        accumulated = add_messages(&accumulated, &write.value).map_err(|error| match error {
+            Error::InvalidUpdate(message) => {
+                Error::InvalidUpdate(format!("channel '{channel}' add_messages: {message}"))
+            }
+            other => other,
+        })?;
+    }
+    Ok(accumulated)
 }
 
 fn fold_custom(
