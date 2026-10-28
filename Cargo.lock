@@ -74,6 +74,7 @@ dependencies = [
  "langgraph-core",
  "langgraph-llm",
  "langgraph-prebuilt",
+ "serde_json",
 ]
 
 [[package]]

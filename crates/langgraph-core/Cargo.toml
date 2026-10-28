@@ -1,6 +1,6 @@
 [package]
 name = "langgraph-core"
-description = "State, graph builder, and Pregel runtime for langgraph-rs. The graph API arrives in later milestones."
+description = "State channels, reducers, and the graph builder for langgraph-rs."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

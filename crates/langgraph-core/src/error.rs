@@ -1,7 +1,8 @@
-//! Library errors for state channels.
+//! Library errors.
 //!
-//! Later milestones add variants to this enum. This milestone only returns
-//! the ones the reducer and schema checks produce.
+//! Channel folds return [`Error::InvalidUpdate`]. Schema checks and
+//! [`crate::GraphBuilder::compile`] return [`Error::GraphValidation`].
+//! Later milestones add variants to this enum.
 
 use thiserror::Error;
 
@@ -17,11 +18,13 @@ pub enum Error {
     #[error("invalid update: {0}")]
     InvalidUpdate(String),
 
-    /// The channel schema is not usable.
+    /// The graph or its channel schema is not usable.
     ///
     /// Empty names, duplicate names, and reserved names are rejected when a
-    /// channel map is built. Reading a map with a different [`crate::GraphState`]
-    /// schema fails the same way.
+    /// channel map is built. [`crate::GraphBuilder::compile`] rejects those
+    /// names on nodes and fields, and rejects edges that do not connect
+    /// [`crate::START`], registered nodes, and [`crate::END`]. Reading a map
+    /// with a different [`crate::GraphState`] schema fails the same way.
     #[error("graph validation: {0}")]
     GraphValidation(String),
 }

@@ -8,7 +8,7 @@ The design is in [ARCHITECTURE.md](ARCHITECTURE.md). The v0.1 pull-request seque
 
 ## Quickstart
 
-State channels and reducers are in the crates: `GraphState`, a JSON channel map, `u64` channel versions, and overwrite, append, custom, and `add_messages` folds. The `langgraph` facade re-exports those types. The graph builder, Pregel execution, checkpointers, and the ReAct agent arrive in the later milestones in [ROADMAP.md](ROADMAP.md). This tree has no runnable graph example yet.
+State channels, reducers, and the graph builder are in the crates. `GraphState` is a JSON channel map with `u64` versions and overwrite, append, custom, and `add_messages` folds. `GraphBuilder` records sync and async nodes, ordinary edges, waiting edges, and conditional routers. `compile` checks that structure and does not run the graph. Pregel execution, checkpointers, and the ReAct agent arrive in the later milestones in [ROADMAP.md](ROADMAP.md). This tree has no runnable graph example yet.
 
 Rust is pinned to stable 1.99.1 in `rust-toolchain.toml`. From a checkout:
 
@@ -16,7 +16,7 @@ Rust is pinned to stable 1.99.1 in `rust-toolchain.toml`. From a checkout:
 cargo test --workspace --all-targets
 ```
 
-That builds the workspace and runs the state-channel tests, the message-reducer tests, and the scaffold smoke tests.
+That builds the workspace and runs the state-channel tests, the message-reducer tests, the graph-builder tests, and the scaffold smoke tests.
 
 GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` on every pull request and on pushes to `main`.
 
@@ -24,8 +24,8 @@ GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --workspace --al
 
 | Path | Role |
 | --- | --- |
-| `crates/langgraph` | Facade. Downstream code should depend on this crate once the API exists. |
-| `crates/langgraph-core` | State channels and reducers. The builder and Pregel runtime arrive later. |
+| `crates/langgraph` | Facade. Downstream code should depend on this crate. |
+| `crates/langgraph-core` | State channels, reducers, and the graph builder. The Pregel runtime arrives later. |
 | `crates/langgraph-checkpoint` | `Checkpointer`, in-memory saver, SQLite saver. |
 | `crates/langgraph-llm` | `ChatModel`, mock model, optional OpenAI feature. |
 | `crates/langgraph-prebuilt` | ReAct tool-calling loop. |
