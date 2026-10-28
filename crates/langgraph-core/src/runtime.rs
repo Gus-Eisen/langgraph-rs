@@ -11,7 +11,8 @@
 //! it has already consumed. A checkpointer persists that map with the channel
 //! values so a later invoke can resume. [`crate::interrupt`] pauses a task.
 //! Finished siblings keep their writes in `put_writes` until the superstep
-//! commits.
+//! commits. [`crate::CompiledGraph::stream`] emits values, updates, and
+//! events from this same loop. `invoke` does not emit them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use langgraph_checkpoint::{
     CheckpointTuple, Checkpointer, PendingWrite,
 };
 use serde_json::{json, Value};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::builder::{
     Command, ConditionalEdge, Edge, EdgeSource, GraphTarget, InterruptSet, InvokeNode, RouteTarget,
@@ -33,6 +35,7 @@ use crate::interrupt::{
     CHANNEL_RESUME, CHANNEL_TASKS, INTERRUPT_SEEN,
 };
 use crate::state::{ChannelMap, Write};
+use crate::stream::{ChannelEmit, Emit, GraphStream, NoEmit, StreamModes, TaskFinish};
 use crate::{Error, GraphState, END, START};
 
 /// Default superstep budget for [`RunConfig::new`].
@@ -291,9 +294,9 @@ where
     /// starting the next one. Routers are not a separate superstep. A
     /// breakpoint pause does not count as a superstep.
     ///
-    /// Polling this future outside tokio returns [`Error::NoRuntime`]. There
-    /// is no `stream` method. A conditional router or a command `goto` may
-    /// return [`crate::Send`].
+    /// Polling this future outside tokio returns [`Error::NoRuntime`].
+    /// [`CompiledGraph::stream`] yields the same run. A conditional router
+    /// or a command `goto` may return [`crate::Send`].
     ///
     /// With a checkpointer, the call loads `config`'s checkpoint first
     /// (`checkpoint_id` when set, otherwise the latest in the thread and
@@ -314,6 +317,63 @@ where
     where
         I: InvokeInput<S>,
     {
+        let run_input = self.prepare(input, config)?;
+        self.drive(run_input, config, &NoEmit).await
+    }
+
+    /// Yield events while the graph runs.
+    ///
+    /// `modes` selects [`crate::StreamModes::values`],
+    /// [`crate::StreamModes::updates`], and [`crate::StreamModes::events`].
+    /// Combine them with [`std::ops::BitOr`]. The run is the same one
+    /// [`CompiledGraph::invoke`] performs. Events are sent as the tasks
+    /// start and finish, and at each superstep barrier. [`GraphStream::output`]
+    /// is that `invoke` result: [`RunOutput::Finished`], [`RunOutput::Interrupted`],
+    /// or the same error.
+    ///
+    /// `values` is the full committed state after each barrier, and the state
+    /// at an interrupt. `updates` is one item per task that wrote, the node
+    /// name and that task's update, in task order at the barrier. `events`
+    /// is [`crate::StreamEvent::TaskStarted`], [`crate::StreamEvent::TaskFinished`]
+    /// (the update or the error), [`crate::StreamEvent::Checkpoint`] when a
+    /// saver is set, and [`crate::StreamEvent::Interrupted`]. An interrupt
+    /// emits `Interrupted` and ends the stream.
+    ///
+    /// Every event carries a [`crate::Namespace`]. A root run uses the empty
+    /// path. There is no token stream and no user stream writer.
+    ///
+    /// `S::Update` must be [`Clone`] because one update can be both a
+    /// `TaskFinished` event and an `updates` event. Polling this future
+    /// outside tokio returns [`Error::NoRuntime`] before any event.
+    /// Sync checks that `invoke` returns before its first `.await` point
+    /// (`ParentGraph`, a missing thread id, a recursion limit below 1) are
+    /// returned here the same way.
+    pub async fn stream<I>(
+        &self,
+        input: I,
+        config: &RunConfig,
+        modes: StreamModes,
+    ) -> Result<GraphStream<S>, Error>
+    where
+        I: InvokeInput<S>,
+        S::Update: Clone,
+    {
+        let run_input = self.prepare(input, config)?;
+        let config = config.clone();
+        let graph = self.clone();
+        let (tx, rx) = unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let emit = ChannelEmit::new(modes, tx);
+            graph.drive(run_input, &config, &emit).await
+        });
+        Ok(GraphStream::new(rx, handle))
+    }
+
+    /// Sync checks shared by `invoke` and `stream`, before any checkpoint read.
+    fn prepare<I>(&self, input: I, config: &RunConfig) -> Result<RunInput, Error>
+    where
+        I: InvokeInput<S>,
+    {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(Error::NoRuntime);
         }
@@ -321,6 +381,34 @@ where
         if run_input.graph == GraphTarget::Parent {
             return Err(Error::ParentGraph);
         }
+        let breakpoints = !self.interrupt_before.is_empty() || !self.interrupt_after.is_empty();
+        let resume_set = run_input.resume.is_some() || config.get_resume().is_some();
+        if config.checkpointer.is_some() && config.get_thread_id().is_none() {
+            return Err(Error::MissingThreadId);
+        }
+        if breakpoints && config.checkpointer.is_none() {
+            return Err(Error::MissingThreadId);
+        }
+        if resume_set && config.checkpointer.is_none() {
+            return Err(Error::MissingThreadId);
+        }
+        if config.recursion_limit < 1 {
+            return Err(Error::GraphValidation(
+                "recursion limit must be at least 1".into(),
+            ));
+        }
+        Ok(run_input)
+    }
+
+    async fn drive<E>(
+        &self,
+        run_input: RunInput,
+        config: &RunConfig,
+        emit: &E,
+    ) -> Result<RunOutput<S>, Error>
+    where
+        E: Emit<S>,
+    {
         let RunInput {
             writes,
             resume: command_resume,
@@ -329,21 +417,6 @@ where
             honor_on_resume,
         } = run_input;
         let resume = command_resume.or_else(|| config.resume.clone());
-        if config.checkpointer.is_some() && config.get_thread_id().is_none() {
-            return Err(Error::MissingThreadId);
-        }
-        let breakpoints = !self.interrupt_before.is_empty() || !self.interrupt_after.is_empty();
-        if breakpoints && config.checkpointer.is_none() {
-            return Err(Error::MissingThreadId);
-        }
-        if resume.is_some() && config.checkpointer.is_none() {
-            return Err(Error::MissingThreadId);
-        }
-        if config.recursion_limit < 1 {
-            return Err(Error::GraphValidation(
-                "recursion limit must be at least 1".into(),
-            ));
-        }
 
         let nodes = node_map(&self.nodes);
         let known = Arc::new(nodes.keys().cloned().collect::<BTreeSet<_>>());
@@ -395,25 +468,23 @@ where
                 }
             }
             if let Some(saver) = saver.as_ref() {
-                parent_id = Some(
-                    save_checkpoint(
-                        saver.as_ref(),
-                        config,
-                        parent_id.as_deref(),
-                        SavedStep {
-                            channels: &channels,
-                            control: &control,
-                            updated: &input_channels,
-                            source: CheckpointSource::Input,
-                            step,
-                        },
-                    )
-                    .await?
-                    .checkpoint_id
-                    .ok_or_else(|| {
-                        Error::Checkpoint("saver did not return a checkpoint id".into())
-                    })?,
-                );
+                let saved = save_checkpoint(
+                    saver.as_ref(),
+                    config,
+                    parent_id.as_deref(),
+                    SavedStep {
+                        channels: &channels,
+                        control: &control,
+                        updated: &input_channels,
+                        source: CheckpointSource::Input,
+                        step,
+                    },
+                )
+                .await?;
+                parent_id = Some(saved.checkpoint_id.clone().ok_or_else(|| {
+                    Error::Checkpoint("saver did not return a checkpoint id".into())
+                })?);
+                emit.checkpoint(&saved);
             }
         }
 
@@ -452,7 +523,9 @@ where
                     )
                     .await?;
                     put_pending(saver.as_ref(), &saved, &breakpoint_writes()).await?;
+                    emit.checkpoint(&saved);
                 }
+                emit_pause::<S, _>(emit, &channels, Vec::new())?;
                 return Ok(RunOutput::Interrupted {
                     state: channels.to_state()?,
                     interrupts: Vec::new(),
@@ -470,6 +543,7 @@ where
                     config,
                     resume: resume.as_ref(),
                 },
+                emit,
             )
             .await?
             {
@@ -506,8 +580,12 @@ where
                         if pause_after {
                             put_pending(saver.as_ref(), &saved, &breakpoint_writes()).await?;
                         }
+                        emit.checkpoint(&saved);
                     }
                     if pause_after {
+                        if emit.wants_events() {
+                            emit.interrupted(channels.to_state()?, Vec::new());
+                        }
                         return Ok(RunOutput::Interrupted {
                             state: channels.to_state()?,
                             interrupts: Vec::new(),
@@ -534,7 +612,9 @@ where
                         )
                         .await?;
                         put_pending(saver.as_ref(), &saved, &pending).await?;
+                        emit.checkpoint(&saved);
                     }
+                    emit_pause::<S, _>(emit, &channels, interrupts.clone())?;
                     return Ok(RunOutput::Interrupted {
                         state: channels.to_state()?,
                         interrupts,
@@ -818,13 +898,16 @@ struct Scheduled {
     send_value: Option<Value>,
 }
 
-struct TaskOutput {
+struct TaskOutput<S: GraphState> {
+    name: String,
     task_id: String,
     writes: Vec<Write>,
     routed: Vec<RoutePush>,
     pause: Option<TaskPause>,
     /// `Command.goto` replaced this task's static outgoing edges.
     skip_static: bool,
+    /// Update the node returned. `None` when the task is replayed or paused.
+    update: Option<S::Update>,
 }
 
 struct StepShared<S: GraphState> {
@@ -1178,7 +1261,7 @@ fn after_command<S: GraphState>(
     task_id: String,
     command: Command<S::Update>,
     shared: &StepShared<S>,
-) -> Result<TaskOutput, Error> {
+) -> Result<TaskOutput<S>, Error> {
     if command.graph == GraphTarget::Parent {
         return Err(Error::ParentGraph);
     }
@@ -1206,11 +1289,13 @@ fn after_command<S: GraphState>(
         (Vec::new(), false)
     };
     Ok(TaskOutput {
+        name,
         task_id,
         writes,
         routed,
         pause: None,
         skip_static,
+        update: command.update,
     })
 }
 
@@ -1277,7 +1362,7 @@ fn spawn_task<S>(
     name: String,
     task_id: String,
     frame: FrameHandle,
-) -> JoinHandle<Result<TaskOutput, Error>>
+) -> JoinHandle<Result<TaskOutput<S>, Error>>
 where
     S: GraphState + Send + Sync + 'static,
     S::Update: Send + 'static,
@@ -1303,9 +1388,10 @@ fn finish_task<S: GraphState>(
     command: Result<Command<S::Update>, Error>,
     frame: &InterruptFrame,
     shared: &StepShared<S>,
-) -> Result<TaskOutput, Error> {
+) -> Result<TaskOutput<S>, Error> {
     if let Some(interrupt) = frame.take_raised() {
         return Ok(TaskOutput {
+            name,
             task_id,
             writes: Vec::new(),
             routed: Vec::new(),
@@ -1314,6 +1400,7 @@ fn finish_task<S: GraphState>(
                 resume_values: frame.resume_values(),
             }),
             skip_static: false,
+            update: None,
         });
     }
     match command {
@@ -1333,15 +1420,35 @@ struct SuperstepInput<'a, S: GraphState> {
     resume: Option<&'a Resume>,
 }
 
-async fn run_superstep<S>(
+fn emit_pause<S, E>(
+    emit: &E,
+    channels: &ChannelMap,
+    interrupts: Vec<Interrupt>,
+) -> Result<(), Error>
+where
+    S: GraphState,
+    E: Emit<S>,
+{
+    if emit.wants_values() {
+        emit.values(channels.to_state()?);
+    }
+    if emit.wants_events() {
+        emit.interrupted(channels.to_state()?, interrupts);
+    }
+    Ok(())
+}
+
+async fn run_superstep<S, E>(
     channels: &mut ChannelMap,
     control: &mut Control,
     scheduled: Vec<Scheduled>,
     input: SuperstepInput<'_, S>,
+    emit: &E,
 ) -> Result<StepOutcome, Error>
 where
     S: GraphState + Send + Sync + 'static,
     S::Update: Send + 'static,
+    E: Emit<S>,
 {
     let SuperstepInput {
         nodes,
@@ -1379,17 +1486,18 @@ where
         null_resume_task(&scheduled, pending, null_value.is_some()).map(str::to_string);
 
     let mut results = Vec::new();
-    let mut handles = Vec::new();
-    let mut handle_names = Vec::new();
+    let mut running = JoinSet::new();
     for (task, view) in scheduled.iter().zip(views) {
         if task_done(pending, &task.task_id) {
             let replay = decode_replay(pending, &task.task_id)?;
             results.push(TaskOutput {
+                name: task.name.clone(),
                 task_id: task.task_id.clone(),
                 writes: replay.writes,
                 routed: replay.routed,
                 pause: None,
                 skip_static: replay.skip_static,
+                update: None,
             });
             continue;
         }
@@ -1407,32 +1515,62 @@ where
             },
             resume_map: resume_map.clone(),
         });
-        handle_names.push(task.name.clone());
-        handles.push(spawn_task(
+        emit.task_started(&task.name);
+        let handle = spawn_task(
             node,
             view.expect("running task has an input view"),
             Arc::clone(&shared),
             task.name.clone(),
             task.task_id.clone(),
             frame,
-        ));
+        );
+        let name = task.name.clone();
+        running.spawn(async move {
+            let joined = handle.await;
+            (name, joined)
+        });
     }
 
     let mut failures = Vec::new();
-    for (name, handle) in handle_names.into_iter().zip(handles) {
-        match handle.await {
-            Ok(Ok(output)) => results.push(output),
-            Ok(Err(error)) => failures.push((name, error)),
+    while let Some(joined) = running.join_next().await {
+        let (name, joined) = match joined {
+            Ok(pair) => pair,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => {
+                let error = Error::Node {
+                    node: "task".to_string(),
+                    message: "task was cancelled".into(),
+                };
+                emit.task_finished("task", TaskFinish::Error(&error));
+                failures.push(("task".to_string(), error));
+                continue;
+            }
+        };
+        match joined {
+            Ok(Ok(output)) => {
+                if output.pause.is_some() {
+                    let error = Error::GraphInterrupt;
+                    emit.task_finished(&output.name, TaskFinish::Error(&error));
+                } else {
+                    emit.task_finished(&output.name, TaskFinish::Update(&output.update));
+                }
+                results.push(output);
+            }
+            Ok(Err(error)) => {
+                emit.task_finished(&name, TaskFinish::Error(&error));
+                failures.push((name, error));
+            }
             Err(join_error) if join_error.is_panic() => {
                 std::panic::resume_unwind(join_error.into_panic());
             }
-            Err(_) => failures.push((
-                name.clone(),
-                Error::Node {
-                    node: name,
+            Err(_) => {
+                let error = Error::Node {
+                    node: name.clone(),
                     message: "task was cancelled".into(),
-                },
-            )),
+                };
+                emit.task_finished(&name, TaskFinish::Error(&error));
+                failures.push((name, error));
+            }
         }
     }
     if failures
@@ -1482,11 +1620,29 @@ where
     }
 
     results.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let wrote: Vec<bool> = results
+        .iter()
+        .map(|result| !result.writes.is_empty())
+        .collect();
     let mut writes = Vec::new();
     for result in &mut results {
         writes.append(&mut result.writes);
     }
     channels.apply_writes(&writes)?;
+
+    if emit.wants_updates() {
+        for (result, did_write) in results.iter().zip(wrote) {
+            if !did_write {
+                continue;
+            }
+            if let Some(update) = &result.update {
+                emit.wrote(&result.name, update);
+            }
+        }
+    }
+    if emit.wants_values() {
+        emit.values(channels.to_state()?);
+    }
 
     for task in &scheduled {
         if !task.consumed.is_empty() {
@@ -2048,6 +2204,27 @@ mod tests {
         let config = RunConfig::default();
         let future = graph.invoke(&state, &config);
         assert_send(&future);
+    }
+
+    #[test]
+    fn stream_outside_tokio_returns_no_runtime() {
+        let graph = compile(|builder| {
+            builder
+                .add_node("once", |_state: &Sample| Ok(set_count(1)))
+                .add_edge(START, "once")
+                .add_edge("once", END);
+        });
+        let state = sample(0);
+        let config = RunConfig::default();
+        let mut future =
+            std::pin::pin!(graph.stream(&state, &config, crate::StreamModes::values()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(Err(Error::NoRuntime)) => {}
+            std::task::Poll::Ready(Ok(_)) => panic!("expected NoRuntime, got a stream"),
+            std::task::Poll::Pending => panic!("expected NoRuntime, got Pending"),
+            std::task::Poll::Ready(Err(error)) => panic!("expected NoRuntime, got {error}"),
+        }
     }
 
     #[test]

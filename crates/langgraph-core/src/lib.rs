@@ -6,10 +6,11 @@
 //! `(task_path, task_id, write_index)` order. [`GraphBuilder`] records nodes
 //! and edges. [`GraphBuilder::compile`] checks that structure.
 //! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
-//! runtime. A checkpointer on [`RunConfig`] stores each superstep and can
-//! resume a thread. [`interrupt`] pauses a node until [`Resume`] supplies a
-//! value. A conditional router may return [`Send`]. A node may return
-//! [`Command`] in place of a plain update. See the repository
+//! runtime. [`CompiledGraph::stream`] yields values, updates, and events
+//! from that same run. A checkpointer on [`RunConfig`] stores each superstep
+//! and can resume a thread. [`interrupt`] pauses a node until [`Resume`]
+//! supplies a value. A conditional router may return [`Send`]. A node may
+//! return [`Command`] in place of a plain update. See the repository
 //! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
@@ -21,6 +22,7 @@ mod messages;
 mod reducer;
 mod runtime;
 mod state;
+mod stream;
 
 pub use builder::{
     packet::Send, AsyncCommandMarker, AsyncNodeMarker, Command, CompiledGraph, EdgeSource,
@@ -35,6 +37,7 @@ pub use runtime::{
     InvokeInput, PendingTask, RunConfig, RunInput, StateSnapshot, DEFAULT_RECURSION_LIMIT,
 };
 pub use state::{ChannelMap, GraphState, Write, RESERVED_NAMES};
+pub use stream::{GraphStream, Namespace, StreamEvent, StreamMode, StreamModes, TaskResult};
 
 /// Version of `langgraph-core`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

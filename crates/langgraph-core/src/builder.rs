@@ -766,6 +766,22 @@ pub struct CompiledGraph<S: GraphState> {
     pub(crate) interrupt_after: InterruptSet,
 }
 
+impl<S: GraphState> Clone for CompiledGraph<S> {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|(name, node)| (name.clone(), Arc::clone(node)))
+                .collect(),
+            edges: self.edges.clone(),
+            conditional_edges: self.conditional_edges.clone(),
+            interrupt_before: self.interrupt_before.clone(),
+            interrupt_after: self.interrupt_after.clone(),
+        }
+    }
+}
+
 impl<S: GraphState> fmt::Debug for CompiledGraph<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
