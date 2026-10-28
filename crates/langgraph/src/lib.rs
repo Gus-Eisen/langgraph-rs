@@ -1,11 +1,15 @@
 //! LangGraph for Rust.
 //!
-//! This crate is the public facade. Milestone 0 links the workspace crates and
-//! does not expose a graph API. Types for state, execution, checkpoints, and
-//! the prebuilt agent land in later milestones. See the repository
-//! `ROADMAP.md` and `ARCHITECTURE.md`.
+//! This crate is the public facade. It re-exports state channels and reducers
+//! from `langgraph-core`. The graph builder, Pregel runtime, checkpointer,
+//! and prebuilt agent are later milestones. See the repository `ROADMAP.md`
+//! and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
+
+pub use langgraph_core::{
+    ChannelMap, CustomReducer, Error, Field, GraphState, Reducer, Write, RESERVED_NAMES,
+};
 
 /// Version of this facade crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

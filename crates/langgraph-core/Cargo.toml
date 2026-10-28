@@ -10,4 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 langgraph-checkpoint = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
