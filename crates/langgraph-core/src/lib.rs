@@ -4,8 +4,9 @@
 //! field list, partial updates, and conversion to and from those values.
 //! Overwrite, append, custom, and `add_messages` reducers fold a step in
 //! `(task_path, task_id, write_index)` order. [`GraphBuilder`] records nodes
-//! and edges. [`GraphBuilder::compile`] checks that structure and does not
-//! run the graph. The Pregel runtime is a later milestone. See the repository
+//! and edges. [`GraphBuilder::compile`] checks that structure.
+//! [`CompiledGraph::invoke`] runs Pregel supersteps on the current tokio
+//! runtime. Checkpointing is a later milestone. See the repository
 //! `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
@@ -14,6 +15,7 @@ mod builder;
 mod error;
 mod messages;
 mod reducer;
+mod runtime;
 mod state;
 
 pub use builder::{
@@ -23,6 +25,7 @@ pub use builder::{
 pub use error::Error;
 pub use messages::{add_messages, REMOVE_ALL_MESSAGES};
 pub use reducer::{CustomReducer, Field, Reducer};
+pub use runtime::{RunConfig, DEFAULT_RECURSION_LIMIT};
 pub use state::{ChannelMap, GraphState, Write, RESERVED_NAMES};
 
 /// Version of `langgraph-core`.

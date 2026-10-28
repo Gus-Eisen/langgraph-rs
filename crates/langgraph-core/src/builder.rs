@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::reducer::Reducer;
@@ -42,9 +43,17 @@ where
 {
     /// Run the node on the committed snapshot.
     ///
-    /// The runtime milestone calls this. Compile only stores the node.
-    #[allow(dead_code)]
+    /// Sync implementations run the function on the caller thread and return
+    /// a ready future. The runtime calls those from `spawn_blocking`. Async
+    /// implementations return a future the runtime awaits on the current
+    /// tokio runtime.
     fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S>;
+
+    /// `true` when [`InvokeNode::call`] finishes on its calling thread.
+    ///
+    /// The runtime uses this to choose `spawn_blocking` instead of awaiting
+    /// the future on a worker.
+    fn is_sync(&self) -> bool;
 }
 
 /// How the runtime runs a conditional router.
@@ -57,7 +66,6 @@ where
     S: GraphState,
 {
     /// Choose the next nodes from the source task's reduced state.
-    #[allow(dead_code)]
     fn route(&self, state: &S) -> Result<Vec<String>, Error>;
 }
 
@@ -96,6 +104,10 @@ where
     fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
         Box::pin(std::future::ready((self.0)(state)))
     }
+
+    fn is_sync(&self) -> bool {
+        true
+    }
 }
 
 struct AsyncNode<F>(F);
@@ -109,6 +121,10 @@ where
 {
     fn call<'a>(&'a self, state: &'a S) -> NodeFuture<'a, S> {
         Box::pin(AsyncCall::call(&self.0, state))
+    }
+
+    fn is_sync(&self) -> bool {
+        false
     }
 }
 
@@ -386,8 +402,18 @@ struct RecordedConditional<S: GraphState> {
 /// not node names.
 pub(crate) struct ConditionalEdge<S: GraphState> {
     pub(crate) from: String,
-    pub(crate) router: Box<dyn InvokeRouter<S>>,
+    pub(crate) router: Arc<dyn InvokeRouter<S>>,
     pub(crate) path_map: Option<BTreeMap<String, String>>,
+}
+
+impl<S: GraphState> Clone for ConditionalEdge<S> {
+    fn clone(&self) -> Self {
+        Self {
+            from: self.from.clone(),
+            router: Arc::clone(&self.router),
+            path_map: self.path_map.clone(),
+        }
+    }
 }
 
 impl<S: GraphState> fmt::Debug for ConditionalEdge<S> {
@@ -403,10 +429,13 @@ impl<S: GraphState> fmt::Debug for ConditionalEdge<S> {
 
 /// Recorded graph structure for `S`.
 ///
-/// [`GraphBuilder::compile`] produces this. It does not run the graph, and it
-/// has no checkpointer and no interrupt breakpoints.
+/// [`GraphBuilder::compile`] produces this. [`CompiledGraph::invoke`] runs it
+/// on the current tokio runtime. There is no checkpointer and no interrupt
+/// breakpoints.
 pub struct CompiledGraph<S: GraphState> {
-    pub(crate) nodes: Vec<(String, Box<dyn InvokeNode<S>>)>,
+    /// Nodes in registration order. `Arc` so a superstep can move each node
+    /// onto `spawn_blocking` or a runtime task without borrowing the graph.
+    pub(crate) nodes: Vec<(String, Arc<dyn InvokeNode<S>>)>,
     pub(crate) edges: Vec<Edge>,
     pub(crate) conditional_edges: Vec<ConditionalEdge<S>>,
 }
@@ -571,7 +600,11 @@ impl<S: GraphState> GraphBuilder<S> {
             return Err(Error::GraphValidation("START has no outgoing edge".into()));
         }
         Ok(CompiledGraph {
-            nodes: self.nodes,
+            nodes: self
+                .nodes
+                .into_iter()
+                .map(|(name, node)| (name, Arc::<dyn InvokeNode<S>>::from(node)))
+                .collect(),
             edges: self.edges,
             conditional_edges,
         })
@@ -600,14 +633,8 @@ impl<S: GraphState> fmt::Debug for GraphBuilder<S> {
     }
 }
 
-fn node_names<S: GraphState>(nodes: &[(String, Box<dyn InvokeNode<S>>)]) -> Vec<&str> {
-    nodes
-        .iter()
-        .map(|(name, node)| {
-            let _stored = node;
-            name.as_str()
-        })
-        .collect()
+fn node_names<T>(nodes: &[(String, T)]) -> Vec<&str> {
+    nodes.iter().map(|(name, _node)| name.as_str()).collect()
 }
 
 fn validate_schema<S: GraphState>() -> Result<(), Error> {
@@ -695,7 +722,7 @@ fn validate_conditional<S: GraphState>(
         };
         compiled.push(ConditionalEdge {
             from: edge.from,
-            router: edge.router,
+            router: Arc::from(edge.router),
             path_map,
         });
     }
