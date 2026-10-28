@@ -1,17 +1,18 @@
 //! LangGraph for Rust.
 //!
 //! This crate is the public facade. It re-exports state channels, reducers,
-//! `add_messages`, the graph builder, Pregel `invoke`, and the in-memory
-//! checkpointer. `compile` checks a graph. `CompiledGraph::invoke` runs it.
-//! The prebuilt agent is a later milestone. See the repository `ROADMAP.md`
-//! and `ARCHITECTURE.md`.
+//! `add_messages`, the graph builder, Pregel `invoke`, and the checkpointers.
+//! `compile` checks a graph. `CompiledGraph::invoke` runs it. `InMemorySaver`
+//! keeps a thread in memory. `SqliteSaver::open` keeps the same checkpoints
+//! in a SQLite file. The prebuilt agent is a later milestone. See the
+//! repository `ROADMAP.md` and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 
 pub use langgraph_checkpoint::{
     checkpoint_timestamp, new_checkpoint_id, BoxFuture, Checkpoint, CheckpointConfig,
     CheckpointMetadata, CheckpointSource, CheckpointTuple, Checkpointer, Error as CheckpointError,
-    InMemorySaver, PendingWrite,
+    InMemorySaver, PendingWrite, SqliteSaver,
 };
 pub use langgraph_core::{
     add_messages, AsyncNodeMarker, ChannelMap, CompiledGraph, CustomReducer, EdgeSource, Error,
@@ -67,6 +68,13 @@ mod tests {
         assert!(crate::RESERVED_NAMES.contains(&crate::START));
         assert!(crate::RESERVED_NAMES.contains(&crate::END));
         assert_eq!(crate::Route::end().destinations(), ["__end__".to_string()]);
+    }
+
+    #[test]
+    fn facade_reexports_the_sqlite_saver() {
+        fn assert_saver<T: crate::Checkpointer>() {}
+        assert_saver::<crate::InMemorySaver>();
+        assert_saver::<crate::SqliteSaver>();
     }
 
     #[test]

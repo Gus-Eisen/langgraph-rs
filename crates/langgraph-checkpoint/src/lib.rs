@@ -1,17 +1,22 @@
 //! Checkpoint storage for langgraph-rs.
 //!
 //! [`Checkpointer`] is the saver protocol. [`InMemorySaver`] keeps one mutex
-//! map on the saver value. Channel values are JSON. This crate does not
-//! depend on another workspace crate; the runtime converts state at the
-//! boundary. SQLite is a later milestone.
+//! map on the saver value. The default `sqlite` feature adds [`SqliteSaver`]:
+//! one bundled SQLite connection behind a mutex, with every call on
+//! `spawn_blocking`. Channel values are JSON. This crate does not depend on
+//! another workspace crate; the runtime converts state at the boundary.
 
 #![forbid(unsafe_code)]
 
 mod memory;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 mod time;
 mod types;
 
 pub use memory::InMemorySaver;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteSaver;
 pub use types::{
     checkpoint_timestamp, new_checkpoint_id, BoxFuture, Checkpoint, CheckpointConfig,
     CheckpointMetadata, CheckpointSource, CheckpointTuple, PendingWrite,
@@ -38,7 +43,8 @@ pub enum Error {
 ///
 /// Futures are boxed so a compiled graph can hold `Arc<dyn Checkpointer>`.
 /// There is no `async-trait` dependency. Implementations may complete the
-/// future immediately, as [`InMemorySaver`] does.
+/// future immediately, as [`InMemorySaver`] does. `SqliteSaver` (default
+/// `sqlite` feature) runs each call on `spawn_blocking`.
 ///
 /// `checkpoint_ns` is empty at the root. A namespace is a separate list on
 /// the same thread. `get_tuple` with no `checkpoint_id` loads the latest
@@ -121,5 +127,7 @@ mod tests {
         assert_bounds::<crate::InMemorySaver>();
         let saver = crate::InMemorySaver::new();
         let _object: &dyn crate::Checkpointer = &saver;
+        #[cfg(feature = "sqlite")]
+        assert_bounds::<crate::SqliteSaver>();
     }
 }

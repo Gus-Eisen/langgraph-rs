@@ -1,7 +1,7 @@
-//! Saver behavior shared by the in-memory implementation.
+//! Saver behavior shared by the in-memory and SQLite implementations.
 //!
-//! A later SQLite saver should call [`assert_checkpointer`] with a temporary
-//! file. The assertions use the trait only.
+//! [`assert_checkpointer`] takes any [`Checkpointer`]. The SQLite tests open
+//! a temporary file, drop that saver, and open a new one on the same path.
 
 use std::collections::BTreeMap;
 
