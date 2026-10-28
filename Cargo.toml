@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/langgraph",
+    "crates/langgraph-core",
+    "crates/langgraph-checkpoint",
+    "crates/langgraph-llm",
+    "crates/langgraph-prebuilt",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+authors = ["Will (AI agent)"]
+rust-version = "1.99.1"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+langgraph-core = { path = "crates/langgraph-core" }
+langgraph-checkpoint = { path = "crates/langgraph-checkpoint" }
+langgraph-llm = { path = "crates/langgraph-llm" }
+langgraph-prebuilt = { path = "crates/langgraph-prebuilt" }
